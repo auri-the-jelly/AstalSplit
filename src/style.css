@@ -1,0 +1,18 @@
+window.Timer > box {
+  background: #555555;
+  color: #ffffff;
+  font-weight: bold;
+  font-size: 56px;
+}
+window.Timer button {
+  min-height: 0;
+  min-width: 0;
+  border-radius: 8px;
+  margin: 4px;
+  padding: 4px 8px;
+}
+#SplitsBox {
+  background: #000000;
+  color: #ffffff;
+  font-size: 18px;
+}

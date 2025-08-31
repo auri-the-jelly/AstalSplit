@@ -1,0 +1,54 @@
+import math
+import time
+from gi.repository import Astal, GObject, GLib, Gtk, GObject, Gio
+
+from timer.SplitsBox import SplitsBox, SplitsList
+
+splits = [
+    {
+        "name": "Split 1",
+        "current": "0.00",
+        "best": "0.00",
+        "current_time": float(1e308),
+        "best_time": float(1e308),
+    },
+    {
+        "name": "Split 2",
+        "current": "0.00",
+        "best": "0.00",
+        "current_time": float(1e308),
+        "best_time": float(1e308),
+    },
+    {
+        "name": "Split 3",
+        "current": "0.00",
+        "best": "0.00",
+        "current_time": float(1e308),
+        "best_time": float(1e308),
+    },
+]
+
+SYNC = GObject.BindingFlags.SYNC_CREATE
+
+
+class TimerBox(Gtk.Box):
+    __gtype_name__ = "TimerBox"
+    timer_string = GObject.Property(type=str, default="00:00.00")
+    timer = None
+
+    def __init__(self, Timer):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        self.timer = Timer
+        self.splits_box = SplitsBox(splits)
+        self.time_label = Gtk.Label(label=Timer.time_string)
+        self.splits_box.connect("end_signal", lambda *_: self.timer.on_reset())
+        self.timer.connect("split_signal", self.on_split)
+        self.timer.bind_property("time_string", self.time_label, "label", SYNC)
+        self.bind_property("timer_string", self.time_label, "label", SYNC)
+        self.append(self.time_label)
+        self.append(self.splits_box)
+
+    def on_split(self, *_):
+        self.splits_box.add_split(
+            self.timer.splits[-1], self.timer.format_time(self.timer.splits[-1])
+        )

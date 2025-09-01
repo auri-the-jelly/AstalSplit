@@ -1,0 +1,359 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<Run version="1.7.0">
+  <GameIcon />
+  <GameName>DELTARUNE</GameName>
+  <CategoryName>Any%</CategoryName>
+  <LayoutPath>
+  </LayoutPath>
+  <Metadata>
+    <Run id="" />
+    <Platform usesEmulator="False">
+    </Platform>
+    <Region>
+    </Region>
+    <Variables />
+    <CustomVariables />
+  </Metadata>
+  <Offset>00:00:00</Offset>
+  <AttemptCount>6</AttemptCount>
+  <AttemptHistory>
+    <Attempt id="1" started="08/27/2025 11:17:39" isStartedSynced="True" ended="08/27/2025 11:17:50" isEndedSynced="True" />
+    <Attempt id="2" started="08/27/2025 11:30:08" isStartedSynced="True" ended="08/27/2025 11:31:29" isEndedSynced="True">
+      <RealTime>00:01:21.4180275</RealTime>
+      <GameTime>00:01:21.4180253</GameTime>
+    </Attempt>
+    <Attempt id="3" started="08/27/2025 11:41:06" isStartedSynced="True" ended="08/27/2025 12:31:37" isEndedSynced="True">
+      <PauseTime>00:00:04.9192779</PauseTime>
+    </Attempt>
+    <Attempt id="4" started="08/28/2025 01:52:50" isStartedSynced="False" ended="08/28/2025 01:58:05" isEndedSynced="True" />
+    <Attempt id="5" started="08/28/2025 02:01:14" isStartedSynced="True" ended="08/28/2025 03:04:54" isEndedSynced="True" />
+    <Attempt id="6" started="08/29/2025 08:09:25" isStartedSynced="True" ended="08/29/2025 08:54:56" isEndedSynced="True">
+      <RealTime>00:45:30.7348366</RealTime>
+      <GameTime>00:45:30.7283532</GameTime>
+    </Attempt>
+  </AttemptHistory>
+  <Segments>
+    <Segment>
+      <Name>Start</Name>
+      <Icon />
+      <SplitTimes>
+        <SplitTime name="Personal Best">
+          <RealTime>00:01:22.2293261</RealTime>
+          <GameTime>00:01:22.2293242</GameTime>
+        </SplitTime>
+      </SplitTimes>
+      <BestSegmentTime>
+        <RealTime>00:01:12.8285023</RealTime>
+        <GameTime>00:01:12.8285003</GameTime>
+      </BestSegmentTime>
+      <SegmentHistory>
+        <Time id="2">
+          <RealTime>00:01:21.4180275</RealTime>
+          <GameTime>00:01:21.4180253</GameTime>
+        </Time>
+        <Time id="3">
+          <RealTime>00:01:16.3499795</RealTime>
+          <GameTime>00:01:16.3499792</GameTime>
+        </Time>
+        <Time id="4">
+          <RealTime>00:01:24.1163513</RealTime>
+          <GameTime>00:01:24.1163486</GameTime>
+        </Time>
+        <Time id="5">
+          <RealTime>00:01:12.8285023</RealTime>
+          <GameTime>00:01:12.8285003</GameTime>
+        </Time>
+        <Time id="6">
+          <RealTime>00:01:22.2293261</RealTime>
+          <GameTime>00:01:22.2293242</GameTime>
+        </Time>
+      </SegmentHistory>
+    </Segment>
+    <Segment>
+      <Name>Dark World Intro</Name>
+      <Icon />
+      <SplitTimes>
+        <SplitTime name="Personal Best">
+          <RealTime>00:05:18.2227500</RealTime>
+          <GameTime>00:05:18.2227481</GameTime>
+        </SplitTime>
+      </SplitTimes>
+      <BestSegmentTime>
+        <RealTime>00:03:55.9934239</RealTime>
+        <GameTime>00:03:55.9934239</GameTime>
+      </BestSegmentTime>
+      <SegmentHistory>
+        <Time id="3">
+          <RealTime>00:04:08.2407615</RealTime>
+          <GameTime>00:04:08.2407615</GameTime>
+        </Time>
+        <Time id="5">
+          <RealTime>00:04:04.2011042</RealTime>
+          <GameTime>00:04:04.2011042</GameTime>
+        </Time>
+        <Time id="6">
+          <RealTime>00:03:55.9934239</RealTime>
+          <GameTime>00:03:55.9934239</GameTime>
+        </Time>
+      </SegmentHistory>
+    </Segment>
+    <Segment>
+      <Name>Field</Name>
+      <Icon />
+      <SplitTimes>
+        <SplitTime name="Personal Best">
+          <RealTime>00:10:25.5003183</RealTime>
+          <GameTime>00:10:25.5003164</GameTime>
+        </SplitTime>
+      </SplitTimes>
+      <BestSegmentTime>
+        <RealTime>00:05:07.2775683</RealTime>
+        <GameTime>00:05:07.2775683</GameTime>
+      </BestSegmentTime>
+      <SegmentHistory>
+        <Time id="3">
+          <RealTime>00:07:15.9234942</RealTime>
+          <GameTime>00:07:15.9234942</GameTime>
+        </Time>
+        <Time id="5">
+          <RealTime>00:06:27.3498987</RealTime>
+          <GameTime>00:06:27.3498987</GameTime>
+        </Time>
+        <Time id="6">
+          <RealTime>00:05:07.2775683</RealTime>
+          <GameTime>00:05:07.2775683</GameTime>
+        </Time>
+      </SegmentHistory>
+    </Segment>
+    <Segment>
+      <Name>Castle</Name>
+      <Icon />
+      <SplitTimes>
+        <SplitTime name="Personal Best">
+          <RealTime>00:21:52.4912556</RealTime>
+          <GameTime>00:21:52.4912537</GameTime>
+        </SplitTime>
+      </SplitTimes>
+      <BestSegmentTime>
+        <RealTime>00:11:26.9909373</RealTime>
+        <GameTime>00:11:26.9909373</GameTime>
+      </BestSegmentTime>
+      <SegmentHistory>
+        <Time id="3">
+          <RealTime>00:11:57.3355379</RealTime>
+          <GameTime>00:11:57.3355379</GameTime>
+        </Time>
+        <Time id="5">
+          <RealTime>00:12:40.2251264</RealTime>
+          <GameTime>00:12:40.2251264</GameTime>
+        </Time>
+        <Time id="6">
+          <RealTime>00:11:26.9909373</RealTime>
+          <GameTime>00:11:26.9909373</GameTime>
+        </Time>
+      </SegmentHistory>
+    </Segment>
+    <Segment>
+      <Name>King</Name>
+      <Icon />
+      <SplitTimes>
+        <SplitTime name="Personal Best">
+          <RealTime>00:39:18.0094179</RealTime>
+          <GameTime>00:39:18.0094160</GameTime>
+        </SplitTime>
+      </SplitTimes>
+      <BestSegmentTime>
+        <RealTime>00:17:25.5181623</RealTime>
+        <GameTime>00:17:25.5181623</GameTime>
+      </BestSegmentTime>
+      <SegmentHistory>
+        <Time id="6">
+          <RealTime>00:17:25.5181623</RealTime>
+          <GameTime>00:17:25.5181623</GameTime>
+        </Time>
+      </SegmentHistory>
+    </Segment>
+    <Segment>
+      <Name>King Exit</Name>
+      <Icon />
+      <SplitTimes>
+        <SplitTime name="Personal Best">
+          <RealTime>00:43:46.3562766</RealTime>
+          <GameTime>00:43:46.3562747</GameTime>
+        </SplitTime>
+      </SplitTimes>
+      <BestSegmentTime>
+        <RealTime>00:04:28.3468587</RealTime>
+        <GameTime>00:04:28.3468587</GameTime>
+      </BestSegmentTime>
+      <SegmentHistory>
+        <Time id="6">
+          <RealTime>00:04:28.3468587</RealTime>
+          <GameTime>00:04:28.3468587</GameTime>
+        </Time>
+      </SegmentHistory>
+    </Segment>
+    <Segment>
+      <Name>Ending</Name>
+      <Icon />
+      <SplitTimes>
+        <SplitTime name="Personal Best">
+          <RealTime>00:45:30.7348366</RealTime>
+          <GameTime>00:45:30.7283532</GameTime>
+        </SplitTime>
+      </SplitTimes>
+      <BestSegmentTime>
+        <RealTime>00:01:44.3785600</RealTime>
+        <GameTime>00:01:44.3720785</GameTime>
+      </BestSegmentTime>
+      <SegmentHistory>
+        <Time id="6">
+          <RealTime>00:01:44.3785600</RealTime>
+          <GameTime>00:01:44.3720785</GameTime>
+        </Time>
+      </SegmentHistory>
+    </Segment>
+  </Segments>
+  <AutoSplitterSettings>
+    <Version>1.5</Version>
+    <ScriptPath>X:\Games\DELTARUNE\LiveSplit_1.8.33\Components\Deltarune.asl</ScriptPath>
+    <Start>True</Start>
+    <Reset>True</Reset>
+    <Split>True</Split>
+    <CustomSettings>
+      <Setting id="AC" type="bool">True</Setting>
+      <Setting id="AC_PauseTimer" type="bool">True</Setting>
+      <Setting id="AC_AlternateCh2" type="bool">True</Setting>
+      <Setting id="AC_PauseTimerOST" type="bool">False</Setting>
+      <Setting id="AC_UnpauseOnLoad" type="bool">False</Setting>
+      <Setting id="AC_UnpauseOnStart" type="bool">False</Setting>
+      <Setting id="Ch1" type="bool">True</Setting>
+      <Setting id="Ch1_School" type="bool">True</Setting>
+      <Setting id="Ch1_CastleTown_DoorClose" type="bool">False</Setting>
+      <Setting id="Ch1_CastleTown_RoomChange" type="bool">True</Setting>
+      <Setting id="Ch1_Fields_Exit" type="bool">True</Setting>
+      <Setting id="Ch1_Checkerboard_Exit" type="bool">False</Setting>
+      <Setting id="Ch1_BakeSale_Enter" type="bool">False</Setting>
+      <Setting id="Ch1_Egg" type="bool">False</Setting>
+      <Setting id="Ch1_SusieLancer_Exit" type="bool">True</Setting>
+      <Setting id="Ch1_Escape_Cell" type="bool">False</Setting>
+      <Setting id="Ch1_Enter_Elevator" type="bool">False</Setting>
+      <Setting id="Ch1_KRound2_Exit" type="bool">False</Setting>
+      <Setting id="Ch1_Throne_Exit" type="bool">False</Setting>
+      <Setting id="Ch1_PreKing_Exit" type="bool">True</Setting>
+      <Setting id="Ch1_King_EndBattle" type="bool">False</Setting>
+      <Setting id="Ch1_King_Exit" type="bool">True</Setting>
+      <Setting id="Ch1_Fountain_Enter" type="bool">False</Setting>
+      <Setting id="Ch1_Fountain_Exit" type="bool">False</Setting>
+      <Setting id="Ch1_Ending" type="bool">True</Setting>
+      <Setting id="Ch1_EndingOST" type="bool">False</Setting>
+      <Setting id="Ch1_AB" type="bool">False</Setting>
+      <Setting id="Ch1_CFWarp" type="bool">False</Setting>
+      <Setting id="Ch1_FBWarp" type="bool">False</Setting>
+      <Setting id="Ch1_BCWarp" type="bool">False</Setting>
+      <Setting id="Ch1_Jevil_EnterRoom" type="bool">False</Setting>
+      <Setting id="Ch1_Jevil_EndBattle" type="bool">False</Setting>
+      <Setting id="Ch1_Jevil_LeaveRoom" type="bool">False</Setting>
+      <Setting id="Ch2" type="bool">False</Setting>
+      <Setting id="Ch2_Library" type="bool">False</Setting>
+      <Setting id="Ch2_ArcadeGameText" type="bool">False</Setting>
+      <Setting id="Ch2_ArcadeGameLeave" type="bool">False</Setting>
+      <Setting id="Ch2_DJFight" type="bool">False</Setting>
+      <Setting id="Ch2_DJShopRoom" type="bool">False</Setting>
+      <Setting id="Ch2_Ragger2" type="bool">False</Setting>
+      <Setting id="Ch2_CyberFields_Exit" type="bool">False</Setting>
+      <Setting id="Ch2_TrashZoneWarp" type="bool">False</Setting>
+      <Setting id="Ch2_TrashZoneWarp2" type="bool">False</Setting>
+      <Setting id="Ch2_MansionWarp" type="bool">False</Setting>
+      <Setting id="Ch2_MansionWarp2" type="bool">False</Setting>
+      <Setting id="Ch2_TZCFWarp" type="bool">False</Setting>
+      <Setting id="Ch2_TZMWarp" type="bool">False</Setting>
+      <Setting id="Ch2_MCFWarp" type="bool">False</Setting>
+      <Setting id="Ch2_MTZWarp" type="bool">False</Setting>
+      <Setting id="Ch2_Egg" type="bool">False</Setting>
+      <Setting id="Ch2_Mouse2Puzzle" type="bool">False</Setting>
+      <Setting id="Ch2_Berdly_Leave" type="bool">False</Setting>
+      <Setting id="Ch2_SpamtonLeave" type="bool">False</Setting>
+      <Setting id="Ch2_CyberCity_Exit" type="bool">False</Setting>
+      <Setting id="Ch2_Mansion_Entrance" type="bool">False</Setting>
+      <Setting id="Ch2_Mansion_Exit" type="bool">False</Setting>
+      <Setting id="Ch2_TasqueManager" type="bool">False</Setting>
+      <Setting id="Ch2_Mauswheel" type="bool">False</Setting>
+      <Setting id="Ch2_AcidLake_Enter" type="bool">False</Setting>
+      <Setting id="Ch2_AcidLake_Exit" type="bool">False</Setting>
+      <Setting id="Ch2_Queen" type="bool">False</Setting>
+      <Setting id="Ch2_GigaQueen" type="bool">False</Setting>
+      <Setting id="Ch2_Fountain_Enter" type="bool">False</Setting>
+      <Setting id="Ch2_Fountain_Exit" type="bool">False</Setting>
+      <Setting id="Ch2_PuppetScarfChest" type="bool">False</Setting>
+      <Setting id="Ch2_Ending" type="bool">False</Setting>
+      <Setting id="Ch2_EndingOST" type="bool">False</Setting>
+      <Setting id="Ch2_AB" type="bool">False</Setting>
+      <Setting id="Ch2_Disk_Loaded" type="bool">False</Setting>
+      <Setting id="Ch2_Disk_Inserted" type="bool">False</Setting>
+      <Setting id="Ch2_SpamtonNEO_End" type="bool">False</Setting>
+      <Setting id="Ch2_SpamtonNEO_Leave" type="bool">False</Setting>
+      <Setting id="Ch2_WR" type="bool">False</Setting>
+      <Setting id="Ch2_FreezeRing" type="bool">False</Setting>
+      <Setting id="Ch2_ThornRing" type="bool">False</Setting>
+      <Setting id="Ch2_SGBerdly" type="bool">False</Setting>
+      <Setting id="Ch2_SGBerdly_LeaveRoom" type="bool">False</Setting>
+      <Setting id="Ch2_SGSpamtonNEO_End" type="bool">False</Setting>
+      <Setting id="Ch3" type="bool">False</Setting>
+      <Setting id="Ch3_EnterRound1" type="bool">False</Setting>
+      <Setting id="Ch3_EnterChef" type="bool">False</Setting>
+      <Setting id="Ch3_EndRound1" type="bool">False</Setting>
+      <Setting id="Ch3_EnterRhythm" type="bool">False</Setting>
+      <Setting id="Ch3_EndRound2" type="bool">False</Setting>
+      <Setting id="Ch3_EndRound3" type="bool">False</Setting>
+      <Setting id="Ch3_EnterTVW" type="bool">False</Setting>
+      <Setting id="Ch3_EnterRouxls" type="bool">False</Setting>
+      <Setting id="Ch3_ExitRouxls" type="bool">False</Setting>
+      <Setting id="Ch3_Egg" type="bool">False</Setting>
+      <Setting id="Ch3_StartTenna" type="bool">False</Setting>
+      <Setting id="Ch3_EndTenna" type="bool">False</Setting>
+      <Setting id="Ch3_StartKnight" type="bool">False</Setting>
+      <Setting id="Ch3_DieToKnight" type="bool">False</Setting>
+      <Setting id="Ch3_EndKnight" type="bool">False</Setting>
+      <Setting id="Ch3_Ending" type="bool">False</Setting>
+      <Setting id="Ch3_EndingOST" type="bool">False</Setting>
+      <Setting id="Ch3_AB" type="bool">False</Setting>
+      <Setting id="Ch3_IceKey" type="bool">False</Setting>
+      <Setting id="Ch3_ShelterKey" type="bool">False</Setting>
+      <Setting id="Ch3_EnterMantle" type="bool">False</Setting>
+      <Setting id="Ch3_EndMantle" type="bool">False</Setting>
+      <Setting id="Ch3_ShadowMantle" type="bool">False</Setting>
+      <Setting id="Ch4" type="bool">False</Setting>
+      <Setting id="Ch4_EnterCT" type="bool">False</Setting>
+      <Setting id="Ch4_StartMike" type="bool">False</Setting>
+      <Setting id="Ch4_EndMike" type="bool">False</Setting>
+      <Setting id="Ch4_NoellesHouse" type="bool">False</Setting>
+      <Setting id="Ch4_EnterDW" type="bool">False</Setting>
+      <Setting id="Ch4_EnterStudy" type="bool">False</Setting>
+      <Setting id="Ch4_Jackenstein" type="bool">False</Setting>
+      <Setting id="Ch4_GrandPiano" type="bool">False</Setting>
+      <Setting id="Ch4_MissMizzle" type="bool">False</Setting>
+      <Setting id="Ch4_Fountain1" type="bool">False</Setting>
+      <Setting id="Ch4_FallDown" type="bool">False</Setting>
+      <Setting id="Ch4_Egg" type="bool">False</Setting>
+      <Setting id="Ch4_FakeGerson" type="bool">False</Setting>
+      <Setting id="Ch4_Fountain2" type="bool">False</Setting>
+      <Setting id="Ch4_PrincessRBN" type="bool">False</Setting>
+      <Setting id="Ch4_PreClimbTitan1" type="bool">False</Setting>
+      <Setting id="Ch4_ClimbTitan1" type="bool">False</Setting>
+      <Setting id="Ch4_PreClimbTitan2" type="bool">False</Setting>
+      <Setting id="Ch4_ClimbTitan" type="bool">False</Setting>
+      <Setting id="Ch4_StartTitan" type="bool">False</Setting>
+      <Setting id="Ch4_InsideTitan" type="bool">False</Setting>
+      <Setting id="Ch4_EndTitan" type="bool">False</Setting>
+      <Setting id="Ch4_Fountain3" type="bool">False</Setting>
+      <Setting id="Ch4_Ending" type="bool">False</Setting>
+      <Setting id="Ch4_EndingOST" type="bool">False</Setting>
+      <Setting id="Ch4_AB" type="bool">False</Setting>
+      <Setting id="Ch4_GoldenPiano" type="bool">False</Setting>
+      <Setting id="Ch4_EnterHoJ" type="bool">False</Setting>
+      <Setting id="Ch4_HammerofJustice" type="bool">False</Setting>
+      <Setting id="Ch4_ExitHoJ" type="bool">False</Setting>
+    </CustomSettings>
+  </AutoSplitterSettings>
+</Run>

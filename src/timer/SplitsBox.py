@@ -6,22 +6,22 @@ from gi.repository import Gio, GObject, Gtk
 # ---- Model ----
 class SplitItem(GObject.GObject):
     name = GObject.Property(type=str)
-    current = GObject.Property(type=str, default="0.00")
-    best = GObject.Property(type=str, default="0.00")
+    current = GObject.Property(type=str, default="00:00.00")
+    best = GObject.Property(type=str, default="00:00.00")
     current_time = GObject.Property(type=float, default=float(1e308))
     best_time = GObject.Property(type=float, default=float(1e308))
 
     def __init__(
         self,
         name,
-        current="0.00",
-        best="0.00",
+        current="00:00.00",
+        best="00:0.00",
         current_time=float(1e308),
         best_time=float(1e308),
     ):
         super().__init__(
             name=name,
-            current="0.00",
+            current=current,
             best=best,
             current_time=current_time,
             best_time=best_time,
@@ -40,13 +40,17 @@ class SplitsList(Gio.ListStore):
         self.remove_all()
         for s in splits:
             # expected keys: name, best, best_time
-            item = SplitItem(
-                name=s["name"],
-                current="0.00",
-                best=s.get("best", "0.00"),
-                current_time=s.get("current_time", float("inf")),
-                best_time=s.get("best_time", float("inf")),
-            )
+            item = SplitItem("Split 1")
+            if type(s) == dict:
+                item = SplitItem(
+                    name=s["name"],
+                    current="00:00.00",
+                    best=s.get("best", "00:00.00"),
+                    current_time=s.get("current_time", float("inf")),
+                    best_time=s.get("best_time", float("inf")),
+                )
+            else:
+                item = s
             self.append(item)
 
 
@@ -60,19 +64,31 @@ class SplitsBox(Gtk.ListBox):
         self.set_selection_mode(Gtk.SelectionMode.NONE)
         self.set_css_classes(["SplitsBox"])
         self.set_name("SplitsBox")
-        # model
-        self.splits_list = SplitsList(splits)
-
+        self.update_splits(splits)
         # bind model -> rows
         self.bind_model(self.splits_list, self._create_row)
+
+    def update_splits(self, splits):
+        # model
+        self.splits_list = splits
 
     def _create_row(self, item: SplitItem):
         # item is a SplitItem
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row.set_hexpand(True)
 
         name_lbl = Gtk.Label(xalign=0, halign=Gtk.Align.START)
         cur_lbl = Gtk.Label(xalign=1, halign=Gtk.Align.END)
         best_lbl = Gtk.Label(xalign=1, halign=Gtk.Align.END)
+
+        # Ensure the times align to the right edge consistently
+        # by adding an expanding spacer between name and times.
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+
+        # Optionally reserve some width for stable columns
+        # cur_lbl.set_width_chars(8)
+        # best_lbl.set_width_chars(8)
 
         # initial text
         name_lbl.set_text(item.props.name)
@@ -89,6 +105,7 @@ class SplitsBox(Gtk.ListBox):
 
         # layout
         row.append(name_lbl)
+        row.append(spacer)
         row.append(cur_lbl)
         row.append(best_lbl)
         return row
@@ -98,11 +115,11 @@ class SplitsBox(Gtk.ListBox):
         n = self.splits_list.get_n_items()
         for i in range(n):
             item = self.splits_list.get_item(i)  # -> SplitItem
-            if item.props.current == "0.00":
+            if item.props.current == "00:00.00":
                 item.props.current = split_string
                 if split_time < item.props.best_time:
                     item.props.best_time = split_time
                     item.props.best = split_string
                 break
-            if i == n - 1:
+            if i == n - 2:
                 self.emit("end_signal")

@@ -1,5 +1,6 @@
 from gi.repository import Gio, GLib, Gtk, Gdk, GLib
 from timer.TimerWindow import TimerWindow
+import os
 
 gresource = Gio.Resource.load("resources.gresource")
 gresource._register()
@@ -42,8 +43,36 @@ class App(Gtk.Application):
                     case "reset":
                         command_line.print_literal("Reset")
                         self.timer_window.timer.on_reset()
+                    case "load":
+                        if len(argv) > 2:
+                            path = ""
+                            if os.path.isabs(argv[2]):
+                                path = argv[2]
+                            else:
+                                path = os.path.abspath(
+                                    os.path.join(command_line.get_cwd(), argv[2])
+                                )
+                            self.lss_path = path
+                            command_line.print_literal(f"Loaded {self.lss_path}")
+                            self.timer_window.timer.load_splits(self.lss_path)
+                            return
+                        else:
+                            command_line.print_literal("usage: astalsplit load <path>")
+                    case _:
+                        command_line.print_literal(
+                            "usage: astalsplit <command> \ncommands:\n    start: start the timer\n    pause: pause the timer\n    toggle: toggle start/pause\n    split: record a split\n    reset: reset the timer\n"
+                        )
                 return
+            else:
+                command_line.print_literal(
+                    "usage: astalsplit <command> \n commands:\n    start: start the timer\n    pause: pause the timer\n    toggle: toggle start/pause\n    split: record a split\n    reset: reset the timer\n"
+                )
         else:
+            if len(argv) > 2:
+                if argv[1] == "load" and os.path.exists(argv[2]):
+                    self.lss_path = os.path.abspath(argv[1])
+                elif argv[1] == "load":
+                    print("Couldn't find file. Ignoring.")
             # main instance, initialize stuff here
             self._init_css()
             self.timer_window = TimerWindow()

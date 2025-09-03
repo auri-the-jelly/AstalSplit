@@ -3,6 +3,7 @@
 *.py[codz]
 *$py.class
 *.pyc
+*.dll
 
 # C extensions
 *.so

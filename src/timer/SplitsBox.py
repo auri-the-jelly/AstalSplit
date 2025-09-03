@@ -16,8 +16,8 @@ class SplitItem(GObject.GObject):
         name,
         current="00:00.00",
         best="00:0.00",
-        current_time=float(1e308),
-        best_time=float(1e308),
+        current_time=1e308,
+        best_time=1e308,
     ):
         super().__init__(
             name=name,

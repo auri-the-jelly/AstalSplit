@@ -7,9 +7,28 @@ from datetime import datetime
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from gi.repository import GObject, GLib, Gio, Gtk
-from proc_utils import find_variable_value
+from proc_utils import (
+    find_variable_value,
+    find_wine_process,
+    get_all_modules,
+    is_64_bit,
+)
 
 # endregion
+
+
+class ASLModule(GObject.Object):
+    __gtype__name__ = "ASLModule"
+
+    def __init__(self, process_name: str):
+        super().__init__()
+        self.process = find_wine_process(process_name)
+
+    def First():
+        return get_all_modules(self.process[0]["pid"]) if self.process else []
+
+    def is64Bit(self):
+        return is_64_bit(self.process[0]["pid"]) if self.process else False
 
 
 class ASLState(GObject.Object):
@@ -110,17 +129,69 @@ class ASLInterpreter(GObject.Object):
         # endregion
         # region Runtime State
         self.vars = {}
-        self.vars_original = {}
+        self.org = {}
         self.current = {}
         self.old = {}
+        self.version = "CH1-4 v1.05 Beta"
         self.settings = ASLSettings()
         self.brace_loc = 0
         # endregion
         # region Initialization
         self.startup()
-        self.vars_original = self.vars.copy()
-        self.exit = exit_func
+        self.org = self.vars.copy()
+        self.exit = self.exit_func
+        GLib.timeout_add(50.0 / 3.0, self.state_update)
 
+    def state_update():
+        for state in self.states:
+            if state.version == self.version:
+                for var_name, meta in state.variables.items():
+                    try:
+                        val = find_variable_value(
+                            state.process_name,
+                            meta.get("base_off", 0),
+                            meta.get("offsets", []),
+                            meta.get("base_module", "DELTARUNE") or "",
+                            meta.get("type", "string256"),
+                        )
+                        if val != self.old.get(var_name):
+                            self.old[var_name] = self.current[var_name]
+                        self.current[var_name] = val
+                    except Exception:
+                        self.current[var_name] = None
+
+    def update(self):
+        pass
+
+    def initialize(self):
+        self.i = 0
+        closing_brace = 0
+        while i < n:
+            line = self.asl_script[self.i].strip()
+            if line.startswith("init"):
+                self.i += 1
+                while self.i < n and "{" not in self.asl_script[self.i]:
+                    self.i += 1
+                if self.i >= n:
+                    break
+                self.i += 1
+                while self.i < n:
+                    if self.asl_script[self.i].startswith("}"):
+                        break
+                    s = self.asl_script[self.i].strip()
+                    if (
+                        "=" in s
+                        and s.endswith(";")
+                        and s.split("=", 1)[0].strip().startswith("vars.")
+                    ):
+                        name = s.split("=", 1)[0].strip()
+                        rhs = s.split("=", 1)[1].strip().strip(";")
+                        self.vars[name] = self.identify_type(rhs)
+                    if "vars.resetVars()" in s:
+                        self.reset_vars()
+                    self.i += 1
+                break
+            self.i += 1
         # endregion
 
     # region Common Helpers

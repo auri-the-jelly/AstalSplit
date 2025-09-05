@@ -83,6 +83,14 @@ def get_module_base(pid, needle):
     return None
 
 
+def get_all_modules(pid):
+    for start, end, perms, path in iter_maps(pid):
+        base = os.path.basename(path).lower()
+        if ".exe" in base or ".dll" in base:
+            return {"start": start, "end": end, "perms": perms, "path": path}
+    return None
+
+
 # -------- safe /proc/pid/mem read --------
 def pread_mem(pid, addr, size):
     fd = os.open(f"/proc/{pid}/mem", os.O_RDONLY)

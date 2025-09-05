@@ -24,11 +24,28 @@ class ASLState(GObject.Object):
         self.variables = variables if variables is not None else {}
 
 
-class ASLSettings(Gio.ListStore):
-    __gtype_name__ = "ASLSettings"
+class ASLSetting(GObject.GObject):
+    """
+    A simple GObject so properties notify correctly and bind to widgets.
+    """
+
+    setting_name = GObject.Property(type=str)
+    display_name = GObject.Property(type=str)
+    setting_value = GObject.Property(type=bool, default=False)
+    parent = GObject.Property(type=str, default="")
+
+    def __init__(self, setting_name, display_name, setting_value=False, parent=""):
+        super().__init__()
+        self.setting_name = setting_name
+        self.display_name = display_name
+        self.setting_value = setting_value
+        self.parent = parent
+
+
+class ASLSettings:
 
     def __init__(self):
-        super().__init__(item_type=GObject.TYPE_PYOBJECT)
+        super().__init__()
         self.settings = {}
 
     def add(self, setting_name, setting_value, display_name, parent=""):
@@ -42,6 +59,45 @@ class ASLSettings(Gio.ListStore):
         if setting_name in self.settings:
             self.settings[setting_name]["tooltip"] = tooltip
 
+    def export_list_object(self):
+        """Return a Gtk.TreeListModel for hierarchical settings.
+
+        Items are ASLSetting GObjects with properties:
+        - setting_name (id)
+        - display_name
+        - setting_value
+        - parent (id of parent, empty string means top-level)
+        """
+
+        # Precreate GObjects so tree uses stable instances at all levels
+        items: dict[str, ASLSetting] = {}
+        for name, meta in self.settings.items():
+            items[name] = ASLSetting(
+                setting_name=name,
+                display_name=meta.get("display_name", name),
+                setting_value=meta.get("value", False),
+                parent=meta.get("parent", "") or "",
+            )
+
+        # Root store: settings with no parent
+        root = Gio.ListStore(item_type=ASLSetting)
+        for name, meta in self.settings.items():
+            if not (meta.get("parent") or ""):
+                root.append(items[name])
+
+        def create_func(item: ASLSetting):
+            parent_name = item.setting_name
+            children = Gio.ListStore(item_type=ASLSetting)
+            for name, meta in self.settings.items():
+                if (meta.get("parent") or "") == parent_name:
+                    children.append(items[name])
+            # Return None when no children so expanders render correctly
+            return children if children.get_n_items() > 0 else None
+
+        # passthrough=True so rows expose our ASLSetting items directly
+        tree = Gtk.TreeListModel.new(root, True, False, create_func)
+        return tree
+
 
 class ASLInterpreter(GObject.Object):
     __gtype__name__ = "ASLInterpreter"
@@ -54,13 +110,17 @@ class ASLInterpreter(GObject.Object):
         # endregion
         # region Runtime State
         self.vars = {}
+        self.vars_original = {}
         self.current = {}
         self.old = {}
         self.settings = ASLSettings()
         self.brace_loc = 0
         # endregion
         # region Initialization
-        self.initialize()
+        self.startup()
+        self.vars_original = self.vars.copy()
+        self.exit = exit_func
+
         # endregion
 
     # region Common Helpers
@@ -179,6 +239,41 @@ class ASLInterpreter(GObject.Object):
             i = l + len(replaced)
         return s
 
+    def reset_vars(self):
+        self.vars = self.vars_original.copy()
+
+    def exit_func(self):
+        self.i = 0
+        n = len(self.asl_script)
+        while self.i < n:
+            line = self.asl_script[self.i].strip()
+            if line.startswith("exit"):
+                # Advance to block start '{'
+                self.i += 1
+                while self.i < n and "{" not in self.asl_script[self.i]:
+                    self.i += 1
+                if self.i >= n:
+                    break
+                # Inside block until matching '}' on a line
+                self.i += 1
+                while self.i < n:
+                    s = self.asl_script[self.i].strip()
+                    if s.startswith("}"):
+                        break
+                    if (
+                        "=" in s
+                        and s.endswith(";")
+                        and s.split("=", 1)[0].strip().startswith("vars.")
+                    ):
+                        name = s.split("=", 1)[0].strip()
+                        rhs = s.split("=", 1)[1].strip().strip(";")
+                        self.vars[name] = self.identify_type(rhs)
+                    if "vars.resetVars()" in s:
+                        self.reset_vars()
+                    self.i += 1
+                break
+            self.i += 1
+
     def _make_pyfunc(self, params: list[str], expr: str):
         py_expr = self._translate_expr(expr)
         code = compile(py_expr, "<asl-func>", "eval")
@@ -204,9 +299,9 @@ class ASLInterpreter(GObject.Object):
             # {"Key", (a,b,c) => expr},
             m = re.match(r'^\{\s*"([^"]+)"\s*,\s*\(([^)]*)\)\s*=>\s*(.*)\}\s*,?$', line)
             if m:
-                key = m.group(1)
-                params = [p.strip() for p in m.group(2).split(",") if p.strip()]
-                expr = m.group(3)
+                key = m[1]
+                params = [p.strip() for p in m[2].split(",") if p.strip()]
+                expr = m[3]
                 d[key] = self._make_pyfunc(params, expr)
             self.i += 1
         return d
@@ -277,7 +372,7 @@ class ASLInterpreter(GObject.Object):
         return _fn
 
     # region Initialization Parsing
-    def initialize(self):
+    def startup(self):
         self.vars = {}
         self.i = 0
         init_line = 0
@@ -300,9 +395,6 @@ class ASLInterpreter(GObject.Object):
                 )
                 self.vars[var_name] = var_value
             self.i += 1
-        # Parse multiline tooltips within the init block for UI usage
-        if init_line:
-            self._parse_init_tooltips(init_line)
         # Fallback/global parsing to ensure settings exist before tooltips
         self._parse_settings_and_tooltips_global()
 
@@ -542,66 +634,6 @@ class ASLInterpreter(GObject.Object):
         return states
 
     # region Init Helpers: tooltips
-    def _parse_init_tooltips(self, start_idx: int):
-        """Scan the init { ... } block and collect settings.SetToolTip entries.
-        Handles multi-line verbatim strings and concatenation with '+'.
-        Stores results in self.settings['tooltips'][name] = tooltip.
-        """
-        i = start_idx
-        n = len(self.asl_script)
-        # find opening '{'
-        while i < n and "{" not in self.asl_script[i]:
-            i += 1
-        if i >= n:
-            return
-        depth = self.asl_script[i].count("{") - self.asl_script[i].count("}")
-        i += 1
-        call_start_pat = re.compile(r"\bsettings\.SetToolTip\s*\(")
-        while i < n and depth > 0:
-            line = self.asl_script[i]
-            depth += line.count("{") - line.count("}")
-            # Capture setting declarations (single-line)
-            if "settings.Add" in line:
-                m = re.search(
-                    r'settings\.Add\s*\(\s*"([^"]+)"\s*(?:,\s*(true|false))?\s*(?:,\s*"([^"]*)")?',
-                    line,
-                )
-                if m:
-                    name = m.group(1)
-                    val = m.group(2)
-                    desc = m.group(3) or ""
-                    default = True if (val is None or val.lower() == "true") else False
-                    try:
-                        self.settings.add(name, default, desc)
-                    except Exception:
-                        pass
-            if call_start_pat.search(line):
-                call = line
-                j = i + 1
-                par = line.count("(") - line.count(")")
-                while j < n:
-                    call += "\n" + self.asl_script[j]
-                    par += self.asl_script[j].count("(") - self.asl_script[j].count(")")
-                    if par <= 0 and self.asl_script[j].strip().endswith(");"):
-                        j += 1
-                        break
-                    j += 1
-                # Extract name and tooltip expr
-                m = re.search(
-                    r'settings\.SetToolTip\s*\(\s*"([^"]+)"\s*,\s*(.*)\)\s*;',
-                    call,
-                    re.S,
-                )
-                if m:
-                    name = m[1]
-                    expr = m[2]
-                    expr = self._replace_verbatim_strings(expr)
-                    tooltip = self._eval_const_string_concat(expr)
-                    if isinstance(tooltip, str):
-                        self.settings.set_tooltip(name, tooltip)
-                i = j
-                continue
-            i += 1
 
     def _eval_const_string_concat(self, expr: str):
         """Evaluate "literal" + "literal" + ... safely. Returns str or None."""
@@ -630,35 +662,71 @@ class ASLInterpreter(GObject.Object):
     # endregion
 
     def _parse_settings_and_tooltips_global(self):
-        """Global regex-based parsing for settings.Add and SetToolTip to ensure
-        settings are captured even if init block parsing misses any."""
-        text = "\n".join(self.asl_script)
-        add_re = re.compile(
-            r'settings\.Add\s*\(\s*"([^"]+)"\s*(?:,\s*(true|false))?\s*(?:,\s*"([^"]*)")?',
-            re.I,
-        )
-        for m in add_re.finditer(text):
-            name = m.group(1)
-            val = (m.group(2) or "true").lower()
-            desc = m.group(3) or ""
-            default = True if val == "true" else False
-            try:
-                self.settings.add(name, default, desc)
-            except Exception:
-                pass
+        """Global regex-based parsing for settings.Add/SetToolTip and
+        settings.CurrentDefaultParent in source order.
 
-        tip_re = re.compile(
-            r'settings\.SetToolTip\s*\(\s*"([^"]+)"\s*,\s*(.*?)\)\s*;', re.S
+        - Respects explicit parent in Add(id, default, desc, parent)
+        - Applies settings.CurrentDefaultParent when parent is omitted
+        - Handles tooltip strings and verbatim string concatenation
+        """
+        text = "\n".join(self.asl_script)
+
+        pattern = re.compile(
+            r"""
+            (?P<defparent>settings\.CurrentDefaultParent\s*=\s*(?P<defval>null|\"[^\"]*\")\s*;) |
+            (?P<add>settings\.Add\s*\(\s*\"(?P<add_name>[^\"]+)\"\s*
+                (?:,\s*(?P<add_bool>true|false))?\s*
+                (?:,\s*\"(?P<add_desc>[^\"]*)\")?\s*
+                (?:,\s*(?P<add_parent>null|\"[^\"]*\"))?\s*\)\s*;) |
+            (?P<tip>settings\.SetToolTip\s*\(\s*\"(?P<tip_name>[^\"]+)\"\s*,\s*(?P<tip_expr>.*?)\)\s*;)
+            """,
+            re.I | re.S | re.X,
         )
-        for m in tip_re.finditer(text):
-            name = m.group(1)
-            expr = self._replace_verbatim_strings(m.group(2))
-            tooltip = self._eval_const_string_concat(expr)
-            if isinstance(tooltip, str):
+
+        current_parent: str | None = None
+
+        for m in pattern.finditer(text):
+            # Handle CurrentDefaultParent assignment
+            if m.group("defparent"):
+                raw = m.group("defval")
+                if raw is None or raw.lower() == "null":
+                    current_parent = None
+                else:
+                    # strip quotes
+                    current_parent = raw.strip()[1:-1]
+                continue
+
+            # Handle settings.Add
+            if m.group("add"):
+                name = m.group("add_name")
+                val = (m.group("add_bool") or "true").lower()
+                desc = m.group("add_desc") or ""
+                parent_tok = m.group("add_parent")
+                if parent_tok is None:
+                    parent = current_parent
+                else:
+                    if parent_tok.lower() == "null":
+                        parent = None
+                    else:
+                        parent = parent_tok.strip()[1:-1]
+                default = True if val == "true" else False
                 try:
-                    self.settings.set_tooltip(name, tooltip)
+                    self.settings.add(name, default, desc, parent)
                 except Exception:
                     pass
+                continue
+
+            # Handle tooltips
+            if m.group("tip"):
+                name = m.group("tip_name")
+                expr = self._replace_verbatim_strings(m.group("tip_expr"))
+                tooltip = self._eval_const_string_concat(expr)
+                if isinstance(tooltip, str):
+                    try:
+                        self.settings.set_tooltip(name, tooltip)
+                    except Exception:
+                        pass
+                continue
 
     # endregion
 
@@ -687,3 +755,6 @@ if __name__ == "__main__":
             for f in var_value:
                 if callable(f):
                     f()
+    for setting_name, meta in asl.settings.settings.items():
+        help_me = asl.settings.export_list_object()
+        print(f"Setting: {setting_name}, Meta: {meta}")

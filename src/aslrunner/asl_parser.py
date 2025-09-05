@@ -140,7 +140,48 @@ class ASLInterpreter(GObject.Object):
         self.startup()
         self.org = self.vars.copy()
         self.exit = self.exit_func
+        self.update = self.update_func
         GLib.timeout_add(50.0 / 3.0, self.state_update)
+
+    def update_func(self):
+        self.i = 0
+        n = len(self.asl_script)
+        while self.i < n:
+            line = self.asl_script[self.i].strip()
+            if line.startswith("update"):
+                # Advance to block start '{'
+                self.i += 1
+                while self.i < n and "{" not in self.asl_script[self.i]:
+                    self.i += 1
+                if self.i >= n:
+                    break
+                # Inside block until matching '}' on a line
+                self.i += 1
+                while self.i < n:
+                    s = self.asl_script[self.i].strip()
+                    if s.startswith("}"):
+                        break
+                    if (
+                        "=" in s
+                        and s.endswith(";")
+                        and s.split("=", 1)[0].strip().startswith("vars.")
+                    ):
+                        name = s.split("=", 1)[0].strip()
+                        rhs = s.split("=", 1)[1].strip().strip(";")
+                        self.vars[name] = self.identify_type(rhs)
+                    if (
+                        "=" in s
+                        and s.endswith(";")
+                        and s.split("=", 1)[0].strip().startswith("current.")
+                    ):
+                        name = s.split("=", 1)[0].strip()
+                        rhs = s.split("=", 1)[1].strip().strip(";")
+                        self.current[name] = self.identify_type(rhs)
+                    if "vars.resetVars()" in s:
+                        self.reset_vars()
+                    self.i += 1
+                break
+            self.i += 1
 
     def state_update():
         for state in self.states:

@@ -15,6 +15,7 @@ from proc_utils import (
     get_module_base,
     get_module_memory,
 )
+from game_plugins import load_plugin
 
 # endregion
 
@@ -151,6 +152,7 @@ class ASLInterpreter(GObject.Object):
 
     def __init__(self, asl_script: str):
         super().__init__()
+        self.asl_path = asl_script
         self.asl_script = open(asl_script, "r", encoding="utf-8").read().splitlines()
         # region State Declarations
         self.states = self.find_states()
@@ -163,6 +165,8 @@ class ASLInterpreter(GObject.Object):
         self.version = "CH1-4 v1.05 Beta"
         self.settings = ASLSettings()
         self.brace_loc = 0
+        self.plugin = None
+        self.initialized = False
         # endregion
         # region Initialization
         self.startup()
@@ -170,6 +174,18 @@ class ASLInterpreter(GObject.Object):
         self.org = self.vars.copy()
         self.exit = self.exit_func
         self.update = self.update_func
+        # Load a game-specific plugin if available (based on first state's process name)
+        first_proc = None
+        if self.states:
+            first_proc = self.states[0].process_name
+        if first_proc:
+            self.plugin = load_plugin(first_proc)
+            if self.plugin:
+                try:
+                    self.plugin.setup()
+                except Exception:
+                    self.plugin = None
+
         GLib.timeout_add(50.0 / 3.0, self.state_update)
 
     def update_func(self):
@@ -212,25 +228,38 @@ class ASLInterpreter(GObject.Object):
                 break
             self.i += 1
 
-    def state_update():
+    def state_update(self):
         for state in self.states:
             if not self.modules.process and ASLModule(state.process_name).process:
                 self.modules = ASLModule(state.process_name)
-            if state.version == self.version:
+            if state.version == self.version or not self.version:
                 for var_name, meta in state.variables.items():
                     try:
                         val = find_variable_value(
                             state.process_name,
                             meta.get("base_off", 0),
                             meta.get("offsets", []),
-                            meta.get("base_module", "DELTARUNE") or "",
+                            meta.get("base_module", "") or "",
                             meta.get("type", "string256"),
                         )
                         if val != self.old.get(var_name):
-                            self.old[var_name] = self.current[var_name]
+                            if var_name in self.current:
+                                self.old[var_name] = self.current[var_name]
                         self.current[var_name] = val
                     except Exception:
                         self.current[var_name] = None
+
+        if self.initialized:
+            self.update_func()
+            # Allow game plugin to compute additional dynamic values
+            if self.plugin:
+                try:
+                    self.plugin.update(self)
+                except Exception:
+                    pass
+
+        # Returning True keeps the GLib timeout running
+        return True
 
     def update(self):
         pass
@@ -269,6 +298,7 @@ class ASLInterpreter(GObject.Object):
                     self.i += 1
                 break
             self.i += 1
+        self.initialized = True
         # endregion
 
     # region Common Helpers
@@ -978,7 +1008,7 @@ class ASLInterpreter(GObject.Object):
 
 
 if __name__ == "__main__":
-    asl = ASLInterpreter("src/aslrunner/Deltarune.asl")
+    asl = ASLInterpreter("aslrunner/Deltarune.asl")
     for state in asl.states:
         print(f"Process: {state.process_name}, Version: {state.version}")
         if state.version == "CH1-4 v1.04":

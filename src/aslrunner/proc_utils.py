@@ -75,19 +75,38 @@ def find_region(pid, addr, size=1):
 
 
 def get_module_base(pid, needle):
+    if os.path.exists(needle):
+        needle = os.path.basename(needle)
     needle = (needle or "").lower()
     for start, end, perms, path in iter_maps(pid):
         base = os.path.basename(path).lower()
+        if ".exe" in base:
+            print(needle + " " + base)
         if needle and needle in base and ("r--p" in perms or "r-xp" in perms):
             return start
     return None
 
 
 def get_all_modules(pid):
+    modules = []
     for start, end, perms, path in iter_maps(pid):
         base = os.path.basename(path).lower()
         if ".exe" in base or ".dll" in base:
-            return {"start": start, "end": end, "perms": perms, "path": path}
+            modules.append({"start": start, "end": end, "perms": perms, "path": path})
+    return modules
+
+
+def get_module_memory(pid, needle):
+    if os.path.exists(needle):
+        needle = os.path.basename(needle)
+    needle = needle.lower()
+    for start, end, perms, path in iter_maps(pid):
+        base = os.path.basename(path).lower()
+        if module_name == base and ("r--p" in perms or "r-xp" in perms):
+            size = end - start
+            with open(f"/proc/{pid}/mem", "rb") as mem_file:
+                mem_file.seek(start)
+                return mem_file.read(size)
     return None
 
 

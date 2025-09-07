@@ -12,20 +12,48 @@ from proc_utils import (
     find_wine_process,
     get_all_modules,
     is_64_bit,
+    get_module_base,
+    get_module_memory,
 )
 
 # endregion
 
 
+class SigScanner:
+    def __init__(self, process, base_addr, mem_size):
+        self.process = process
+        self.base_addr = base_addr
+        self.mem_size = mem_size
+        self.memory = None
+        if self.process:
+            self.memory = get_module_memory(self.process["pid"], self.process["path"])
+
+        def Scan(self):
+            pass
+
+
 class ASLModule(GObject.Object):
     __gtype__name__ = "ASLModule"
 
-    def __init__(self, process_name: str):
+    def __init__(self, process_name: str = None):
         super().__init__()
-        self.process = find_wine_process(process_name)
+        if process_name:
+            self.process = find_wine_process(process_name)[0]
+            self.modules = get_all_modules(self.process["pid"]) if self.process else []
+            self.game = self.First()
+            self.BaseAddress = get_module_base(
+                self.process["pid"], self.First()["path"]
+            )
+            self.ModuleMemorySize = get_module_memory(
+                self.process["pid"], self.First()["path"]
+            )
+            self.FileName = Path(self.First()["path"]).parent
+
+        else:
+            self.process = None
 
     def First():
-        return get_all_modules(self.process[0]["pid"]) if self.process else []
+        return get_all_modules(self.process[0]["pid"])[0] if self.process else []
 
     def is64Bit(self):
         return is_64_bit(self.process[0]["pid"]) if self.process else False
@@ -138,6 +166,7 @@ class ASLInterpreter(GObject.Object):
         # endregion
         # region Initialization
         self.startup()
+        self.modules = ASLModule()
         self.org = self.vars.copy()
         self.exit = self.exit_func
         self.update = self.update_func
@@ -185,6 +214,8 @@ class ASLInterpreter(GObject.Object):
 
     def state_update():
         for state in self.states:
+            if not self.modules.process and ASLModule(state.process_name).process:
+                self.modules = ASLModule(state.process_name)
             if state.version == self.version:
                 for var_name, meta in state.variables.items():
                     try:
@@ -207,6 +238,7 @@ class ASLInterpreter(GObject.Object):
     def initialize(self):
         self.i = 0
         closing_brace = 0
+        init_vars = {}
         while i < n:
             line = self.asl_script[self.i].strip()
             if line.startswith("init"):
@@ -228,6 +260,10 @@ class ASLInterpreter(GObject.Object):
                         name = s.split("=", 1)[0].strip()
                         rhs = s.split("=", 1)[1].strip().strip(";")
                         self.vars[name] = self.identify_type(rhs)
+                    if "=" in s and s.endswith(";") and s.startswith("var "):
+                        name = s.split("=", 1)[0].strip().split(" ", 1)[1].strip()
+                        rhs = s.split("=", 1)[1].strip().strip(";")
+                        init_vars[name] = self.identify_type(rhs)
                     if "vars.resetVars()" in s:
                         self.reset_vars()
                     self.i += 1
@@ -515,18 +551,116 @@ class ASLInterpreter(GObject.Object):
     def identify_type(self, value: str):
         if value.startswith("//"):
             return "INVALID"
-        value = value.strip().replace(",", "")
+        value = value.strip()
         n = len(self.asl_script)
         if "//" in value:
             value = value.split("//")[0]
         if ";" in value:
             value = value.strip().strip(";")
+        # Normalize C# verbatim strings @"..." to safe Python strings
+        value = self._replace_verbatim_strings(value)
+
+        # Helper: evaluate a very small subset of expressions used in the ASL
+        # for paths (properties/functions and string concatenations).
+        def _eval_expr(expr: str):
+            s = expr.strip()
+            # Quick-out quoted strings
+            if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+                try:
+                    return ast.literal_eval(s)
+                except Exception:
+                    return s.strip('"')
+
+            # module.FileName -> full path to the game module
+            if s == "module.FileName":
+                try:
+                    if self.modules and getattr(self.modules, "process", None):
+                        m = self.modules.First()
+                        if isinstance(m, dict) and "path" in m:
+                            return m["path"]
+                except Exception:
+                    pass
+                return ""
+
+            # new FileInfo(x).DirectoryName => Path(x).parent
+            m = re.match(r"^new\s+FileInfo\s*\((.*)\)\.DirectoryName$", s)
+            if m:
+                inner = _eval_expr(m.group(1))
+                try:
+                    return str(Path(str(inner)).parent)
+                except Exception:
+                    return ""
+
+            # Bare new FileInfo(x) => Path(x) string representation
+            m = re.match(r"^new\s+FileInfo\s*\((.*)\)$", s)
+            if m:
+                inner = _eval_expr(m.group(1))
+                try:
+                    return str(Path(str(inner)))
+                except Exception:
+                    return str(inner)
+
+            # Simple string concatenation A + B (used for paths)
+            # Split only at top-level '+', not inside quotes (already handled) or parens.
+            depth = 0
+            plus_pos = -1
+            for i, ch in enumerate(s):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif ch == "+" and depth == 0:
+                    plus_pos = i
+                    break
+            if plus_pos != -1:
+                left = s[:plus_pos]
+                right = s[plus_pos + 1 :]
+                lval = _eval_expr(left)
+                rval = _eval_expr(right)
+                # Ensure string concatenation
+                return f"{lval}{rval}"
+
+            return s
+
         if "new " in value:
             if value.startswith("new Dictionary"):
                 return self._parse_dictionary_of_funcs()
             if value.startswith("new HashSet"):
                 return set()
+            # Map new FileInfo(x).DirectoryName and similar property chains via _eval_expr
+            if value.startswith("new FileInfo"):
+                # Try to evaluate full expression (possibly with + "..." appended)
+                try:
+                    return _eval_expr(value)
+                except Exception:
+                    pass
+                return ""
             return "INVALID"
+        if "modules." in value and self.modules.process:
+            if value.strip() == "modules.First()":
+                return self.modules.First()
+            if value.strip() == "modules.BaseAddress":
+                return self.modules.BaseAddress
+            if value.strip() == "modules.is64Bit()":
+                return self.modules.is64Bit()
+
+        # Support property lookups used directly in expressions, e.g., module.FileName
+        if value == "module.FileName":
+            try:
+                if self.modules and getattr(self.modules, "process", None):
+                    m = self.modules.First()
+                    if isinstance(m, dict) and "path" in m:
+                        return m["path"]
+            except Exception:
+                pass
+            return ""
+
+        # Evaluate simple concatenations and property chains for strings/paths
+        if any(tok in value for tok in ("+", ".DirectoryName", "module.FileName")):
+            try:
+                return _eval_expr(value)
+            except Exception:
+                pass
         if "null" in value.strip():
             return None
         if value.strip() == "false":

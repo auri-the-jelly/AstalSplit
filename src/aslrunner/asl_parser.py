@@ -14,8 +14,6 @@ from proc_utils import (
     is_64_bit,
     get_module_base,
     get_module_memory,
-    ptrace_attach,
-    ptrace_detach,
 )
 from game_plugins import load_plugin
 
@@ -30,20 +28,27 @@ class ASLModule(GObject.Object):
         if process_name and find_wine_process(process_name):
             self.process = find_wine_process(process_name)[0]
             self.modules = get_all_modules(self.process["pid"]) if self.process else []
-            self.game = self.First()
-            self.BaseAddress = get_module_base(
-                self.process["pid"], self.First()["path"]
-            )
-            self.ModuleMemorySize = get_module_memory(
-                self.process["pid"], self.First()["path"]
-            )
-            self.FileName = Path(self.First()["path"]).parent
+            if self.modules:
+                self.game = self.First()
+                self.BaseAddress = get_module_base(
+                    self.process["pid"], self.First()["path"]
+                )
+                self.ModuleMemorySize = get_module_memory(
+                    self.process["pid"], self.First()["path"]
+                )
+                self.FileName = Path(self.First()["path"]).parent
+            else:
+                self.process = None
 
         else:
             self.process = None
 
     def First(self):
-        return get_all_modules(self.process["pid"])[0] if self.process else []
+        return (
+            get_all_modules(self.process["pid"])[0]
+            if self.process and get_all_modules(self.process["pid"])
+            else None
+        )
 
     def is64Bit(self):
         return is_64_bit(self.process["pid"]) if self.process else False
@@ -151,11 +156,12 @@ class ASLInterpreter(GObject.Object):
         self.org = {}
         self.current = {}
         self.old = {}
-        self.version = "CH1-4 v1.04"
+        self.version = "Unknown"
         self.settings = ASLSettings()
         self.brace_loc = 0
         self.plugin = None
         self.initialized = False
+        self._early_exit_update = False
         # endregion
         # region Initialization
         self.startup()
@@ -178,44 +184,54 @@ class ASLInterpreter(GObject.Object):
         GLib.timeout_add(50.0 / 3.0, self.state_update)
 
     def update_func(self):
+        # Find and isolate the 'update' block, then execute only its inner lines.
         self.i = 0
         n = len(self.asl_script)
         update_vars = {}
+
+        def extract_block_after(idx: int) -> tuple[int, list[str]]:
+            i = idx
+            # Move to the first '{'
+            while i < n and "{" not in self.asl_script[i]:
+                i += 1
+            if i >= n:
+                return i, []
+            # Collect balanced block starting from the line with '{'
+            depth = 0
+            block: list[str] = []
+            while i < n:
+                line = self.asl_script[i]
+                depth += line.count("{")
+                block.append(line)
+                i += 1
+                depth -= line.count("}")
+                if depth <= 0:
+                    break
+            # inner between first '{' and its matching '}'
+            start_in = 0
+            for k, s in enumerate(block):
+                if "{" in s:
+                    start_in = k + 1
+                    break
+            end_in = max(start_in, len(block) - 1)
+            inner = block[start_in:end_in]
+            return i, inner
+
         while self.i < n:
             line = self.asl_script[self.i].strip()
             if line.startswith("update"):
-                # Advance to block start '{'
-                self.i += 1
-                while self.i < n and "{" not in self.asl_script[self.i]:
-                    self.i += 1
-                if self.i >= n:
-                    break
-                # Inside block until matching '}' on a line
-                self.i += 1
-                while self.i < n:
-                    s = self.asl_script[self.i].strip()
-                    if s.startswith("}"):
-                        break
-                    # Handle simple if/else blocks
-                    if s.startswith("if"):
-                        self._process_if_block_in_stream(update_vars)
-                        # _process_if_block_in_stream advances self.i
-                        continue
-                    local_store = self._process_simple_statement_line(s, update_vars)
-                    if local_store:
-                        update_vars.update(local_store)
-                    self.i += 1
+                next_i, inner_lines = extract_block_after(self.i + 1)
+                # Execute only inside the update block
+                self._exec_lines(inner_lines, update_vars)
+                # Move index to end of the block and stop
+                self.i = next_i
                 break
             self.i += 1
 
     def state_update(self):
-        if self._early_exit_update:
-            self._early_exit_update = False
-            return True
         for state in self.states:
             if not self.modules.process and ASLModule(state.process_name).process:
                 self.modules = ASLModule(state.process_name)
-                ptrace_attach(self.modules.process["pid"])
             if state.version == self.version:
                 for var_name, meta in state.variables.items():
                     try:
@@ -229,11 +245,13 @@ class ASLInterpreter(GObject.Object):
                         if val != self.old.get(var_name) and var_name in self.current:
                             self.old[var_name] = self.current[var_name]
                         self.current[var_name] = val
-                        print(f"Updated {var_name} = {val}")
-                    except Exception:
+                    except Exception as e:
                         self.current[var_name] = None
 
         if self.initialized:
+            if self._early_exit_update:
+                self._early_exit_update = False
+                return True
             self.update_func()
             # Allow game plugin to compute additional dynamic values
             if self.plugin:
@@ -248,6 +266,8 @@ class ASLInterpreter(GObject.Object):
         return True
 
     def initialize(self):
+        if not self.modules.process:
+            return
         self.i = 0
         closing_brace = 0
         init_vars = {}
@@ -287,12 +307,17 @@ class ASLInterpreter(GObject.Object):
     def hash_match(self, hash: str):
         if not self.hash_switch:
             return None
+        self.i = 0
         for line in self.hash_switch:
             line = line.strip()
-            mc = re.match(r'^case\s+"([^"]+)"\s*:\s*$', line)
+            mc = re.match(r'^case\s+"([^"]+)"\s*:.*$', line)
             if mc and mc.group(1) == hash:
                 # Next line should be return statement
-                self.i += 1
+                while not line.strip().startswith("version =") and self.i < len(
+                    self.hash_switch
+                ):
+                    self.i += 1
+                    line = self.hash_switch[self.i].strip()
                 if self.i < len(self.hash_switch):
                     ret_line = self.hash_switch[self.i].strip()
                     mr = re.match(r"^version =\s+(.*);\s*$", ret_line)
@@ -454,9 +479,12 @@ class ASLInterpreter(GObject.Object):
             return False
 
     def _read_block_or_single(self, start_idx: int) -> tuple[int, list[str]]:
-        """From start_idx, return (next_index, lines_of_block).
-        If a '{' appears at or after start_idx, read a balanced block and
-        return its inner lines; otherwise return the single following line.
+        """Return (next_index, inner_lines) for a block or a single statement.
+
+        - Skips blank lines starting at start_idx.
+        - If a '{' is on the current line OR the previous non-empty line,
+          collect a balanced brace block and return its inner lines.
+        - Otherwise, return the next line as a single statement.
         """
         i = start_idx
         n = len(self.asl_script)
@@ -464,8 +492,16 @@ class ASLInterpreter(GObject.Object):
             i += 1
         if i >= n:
             return i, []
-        if "{" in self.asl_script[i]:
-            depth = 0
+
+        # Detect if we are inside a block whose '{' was on the previous line
+        prev_idx = i - 1
+        while prev_idx >= 0 and self.asl_script[prev_idx].strip() == "":
+            prev_idx -= 1
+        prev_has_open = prev_idx >= 0 and ("{" in self.asl_script[prev_idx])
+
+        # If current line has '{' or previous line opened a block, read a block
+        if prev_has_open or ("{" in self.asl_script[i]):
+            depth = 1 if (prev_has_open and "{" not in self.asl_script[i]) else 0
             block: list[str] = []
             while i < n:
                 line = self.asl_script[i]
@@ -475,19 +511,118 @@ class ASLInterpreter(GObject.Object):
                 i += 1
                 if depth <= 0:
                     break
-            inner: list[str] = []
-            started = False
-            for s in block:
-                if not started:
+
+            # Compute inner lines between the opening '{' and its matching '}'
+            start_in_block = 0
+            if not prev_has_open:
+                # Skip up to and including the first '{' on/after current line
+                for k, s in enumerate(block):
                     if "{" in s:
-                        started = True
-                    continue
-                if "}" in s:
-                    break
-                inner.append(s)
+                        start_in_block = k + 1
+                        break
+            end_in_block = max(start_in_block, len(block) - 1)  # drop closing line
+            inner = block[start_in_block:end_in_block]
             return i, inner
+
         # single statement
         return i + 1, [self.asl_script[i]]
+
+    def _consume_block_from_list(
+        self, lines: list[str], pos: int
+    ) -> tuple[int, list[str]]:
+        """From a local list of lines, return (next_index, inner_lines) for a block starting at pos.
+        If a '{' appears at or after pos, read a balanced block and return its inner lines;
+        otherwise return the single following line.
+        """
+        i2 = pos
+        n2 = len(lines)
+        while i2 < n2 and lines[i2].strip() == "":
+            i2 += 1
+        if i2 >= n2:
+            return i2, []
+        if "{" in lines[i2]:
+            depth2 = 0
+            block2: list[str] = []
+            while i2 < n2:
+                ln = lines[i2]
+                depth2 += ln.count("{")
+                depth2 -= ln.count("}")
+                block2.append(ln)
+                i2 += 1
+                if depth2 <= 0:
+                    break
+            # inner between first '{' and closing '}'
+            start_in = 0
+            for k2, s2 in enumerate(block2):
+                if "{" in s2:
+                    start_in = k2 + 1
+                    break
+            end_in = max(start_in, len(block2) - 1)
+            return i2, block2[start_in:end_in]
+        # single statement
+        return i2 + 1, [lines[i2]]
+
+    def _exec_lines(self, lines: list[str], local_store: dict | None):
+        """Execute a list of simple statements, supporting nested if/else inside the list."""
+        k = 0
+        while k < len(lines):
+            s = lines[k].strip()
+            if not s:
+                k += 1
+                continue
+            if s.startswith("if"):
+                mloc = re.match(r"^if\s*\((.*)\)\s*$", s) or re.match(
+                    r"^if\s*\((.*)\)\s*\{?\s*$", s
+                )
+                if not mloc:
+                    k += 1
+                    continue
+                cond_loc = mloc.group(1).strip()
+                k_then_end, then_lines_loc = self._consume_block_from_list(lines, k + 1)
+                # else / else if
+                j2 = k_then_end
+                while j2 < len(lines) and lines[j2].strip() == "":
+                    j2 += 1
+                else_lines_loc: list[str] = []
+                elif_cond_loc: str | None = None
+                if j2 < len(lines) and lines[j2].strip().startswith("else"):
+                    token2 = lines[j2].strip()
+                    # Allow optional '{' and comments in nested else-if
+                    m2loc = re.match(
+                        r"^else\s+if\s*\((.*)\)\s*(?:\{)?\s*(?://.*)?$",
+                        token2,
+                    )
+                    j2 += 1
+                    if m2loc:
+                        elif_cond_loc = m2loc.group(1).strip()
+                        j2, else_lines_loc = self._consume_block_from_list(lines, j2)
+                    else:
+                        j2, else_lines_loc = self._consume_block_from_list(lines, j2)
+
+                run_then_loc = self._eval_condition(cond_loc)
+                run_else_loc = False
+                if not run_then_loc and elif_cond_loc is not None:
+                    run_else_loc = self._eval_condition(elif_cond_loc)
+                elif not run_then_loc and else_lines_loc:
+                    run_else_loc = True
+
+                chosen = (
+                    then_lines_loc
+                    if run_then_loc
+                    else (else_lines_loc if run_else_loc else [])
+                )
+                self._exec_lines(chosen, local_store)
+                k = j2
+                if getattr(self, "_early_exit_update", False):
+                    return
+                continue
+            if s == "return false;":
+                self._early_exit_update = True
+                return
+            result = self._process_simple_statement_line(s, local_store)
+            if result:
+                local_store.update(result)
+            k += 1
 
     def _process_if_block_in_stream(self, local_store: dict | None) -> dict:
         """Process an if (...) [then] [else] at self.i; advances self.i past it."""
@@ -511,7 +646,8 @@ class ASLInterpreter(GObject.Object):
         elif_cond: str | None = None
         if j < n and self.asl_script[j].strip().startswith("else"):
             token = self.asl_script[j].strip()
-            m2 = re.match(r"^else\s+if\s*\((.*)\)\s*$", token)
+            # Allow optional trailing '{' and end-of-line comments after else-if
+            m2 = re.match(r"^else\s+if\s*\((.*)\)\s*(?:\{)?\s*(?://.*)?$", token)
             j += 1
             if m2:
                 elif_cond = m2.group(1).strip()
@@ -527,26 +663,9 @@ class ASLInterpreter(GObject.Object):
         elif not run_then and else_lines:
             run_else = True
 
-        # Execute the chosen simple lines
+        # Execute the chosen simple lines (supports nested ifs within the extracted list)
         target = then_lines if run_then else (else_lines if run_else else [])
-        for raw in target:
-            s = raw.strip()
-            if not s:
-                continue
-            if s.startswith("if"):
-                # Nested if: temporarily insert into stream for reuse
-                saved = self.i
-                self.asl_script.insert(self.i, s)
-                try:
-                    self._process_if_block_in_stream(local_store)
-                finally:
-                    self.asl_script.pop(self.i)
-                    self.i = saved
-                continue
-            if s == "return false;":
-                self._early_exit_update = True
-                break
-            local_store.update(self._process_simple_statement_line(s, local_store))
+        self._exec_lines(target, local_store)
 
         # Advance after processed blocks
         self.i = j
@@ -583,9 +702,11 @@ class ASLInterpreter(GObject.Object):
             lhs = lhs.strip()
             rhs = rhs.strip().strip(";")
             if lhs.startswith("vars."):
+                lhs = lhs.replace("vars.", "", 1)
                 self.vars[lhs] = self.identify_type(rhs)
                 return
             if lhs.startswith("current."):
+                lhs = lhs.replace("current", "", 1)
                 self.current[lhs] = self.identify_type(rhs)
                 return None
         # Reset call
@@ -733,7 +854,12 @@ class ASLInterpreter(GObject.Object):
                 and "=" in self.asl_script[self.i]
             ):
                 var_name = (
-                    self.asl_script[self.i].strip().strip(";").split("=")[0].strip()
+                    self.asl_script[self.i]
+                    .strip()
+                    .strip(";")
+                    .split("=")[0]
+                    .strip()
+                    .replace("vars.", "")
                 )
                 var_value = self.identify_type(
                     self.asl_script[self.i].strip().strip(";").split("=")[1]
@@ -904,6 +1030,7 @@ class ASLInterpreter(GObject.Object):
                 )
                 if m_clear:
                     target = m_clear.group(1)
+                    target.replace("vars.", "", 1)
 
                     def _do_clear(target=target):
                         obj = self.vars.get(target)
@@ -1175,36 +1302,9 @@ class ASLInterpreter(GObject.Object):
 
 
 if __name__ == "__main__":
-    asl = ASLInterpreter("src/aslrunner/Deltarune.asl")
-    for state in asl.states:
-        print(f"Process: {state.process_name}, Version: {state.version}")
-        if state.version == "CH1-4 v1.04":
-            for var_name, meta in state.variables.items():
-                print(f"  {var_name}: {meta}")
-                try:
-                    val = find_variable_value(
-                        state.process_name,
-                        meta.get("base_off", 0),
-                        meta.get("offsets", []),
-                        meta.get("base_module", "DELTARUNE") or "",
-                        meta.get("type", "string256"),
-                    )
-                    print(f"{var_name}:{val}")
-                except Exception as e:
-                    print(f"Error finding variable {var_name}: {e}")
-    for var_name, var_value in asl.vars.items():
-        print(f"{var_name}: {var_value}")
-        if type(var_value) == list:
-            for f in var_value:
-                if callable(f):
-                    f()
-    for setting_name, meta in asl.settings.settings.items():
-        help_me = asl.settings.export_list_object()
-        print(f"Setting: {setting_name}, Meta: {meta}")
-
+    asl = ASLInterpreter("Deltarune.asl")
     loop = GLib.MainLoop()
     try:
         loop.run()
     except KeyboardInterrupt as e:
         print("Exiting...")
-        ptrace_detach(asl.modules.process["pid"])

@@ -33,6 +33,6 @@ def load_plugin(process_name: str):
         if cls is None:
             return None
         return cls(process_name)
-    except Exception:
+    except Exception as e:
         # If anything goes wrong, silently skip plugin loading
         return None

@@ -33,26 +33,44 @@ def find_wine_process(name: str):
     return matches
 
 
-# -------- ptrace helpers --------
+# -------- libc + process_vm_readv --------
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-PTRACE_ATTACH = 16
-PTRACE_DETACH = 17
 
 
-def ptrace_attach(pid):
-    if libc.ptrace(PTRACE_ATTACH, pid, None, None) != 0:
+class IOVec(ctypes.Structure):
+    _fields_ = [("iov_base", ctypes.c_void_p), ("iov_len", ctypes.c_size_t)]
+
+
+# Configure libc.process_vm_readv if available
+_has_pvr = hasattr(libc, "process_vm_readv")
+if _has_pvr:
+    libc.process_vm_readv.restype = ctypes.c_ssize_t
+    libc.process_vm_readv.argtypes = [
+        ctypes.c_int,  # pid_t
+        ctypes.POINTER(IOVec),
+        ctypes.c_ulong,  # liovcnt
+        ctypes.POINTER(IOVec),
+        ctypes.c_ulong,  # riovcnt
+        ctypes.c_ulong,  # flags
+    ]
+
+
+def _process_vm_read(pid: int, addr: int, size: int) -> bytes:
+    if size <= 0:
+        return b""
+    if not _has_pvr:
+        raise OSError(errno.ENOSYS, "process_vm_readv not available in libc")
+
+    buf = ctypes.create_string_buffer(size)
+    local = IOVec(ctypes.cast(buf, ctypes.c_void_p), size)
+    remote = IOVec(ctypes.c_void_p(addr), size)
+    nread = libc.process_vm_readv(
+        int(pid), ctypes.byref(local), 1, ctypes.byref(remote), 1, 0
+    )
+    if nread < 0:
         e = ctypes.get_errno()
-        raise OSError(e, f"ptrace(ATTACH) failed: {os.strerror(e)}")
-    # wait for stop
-    _, status = os.waitpid(pid, 0)
-    if os.WIFSTOPPED(status) is False:
-        raise RuntimeError("Target did not stop after attach")
-
-
-def ptrace_detach(pid):
-    if libc.ptrace(PTRACE_DETACH, pid, None, None) != 0:
-        e = ctypes.get_errno()
-        raise OSError(e, f"ptrace(DETACH) failed: {os.strerror(e)}")
+        raise OSError(e, f"process_vm_readv failed: {os.strerror(e)}")
+    return buf.raw[:nread]
 
 
 # -------- maps parsing --------
@@ -80,8 +98,6 @@ def get_module_base(pid, needle):
     needle = (needle or "").lower()
     for start, end, perms, path in iter_maps(pid):
         base = os.path.basename(path).lower()
-        if ".exe" in base:
-            print(needle + " " + base)
         if needle and needle in base and ("r--p" in perms or "r-xp" in perms):
             return start
     return None
@@ -104,19 +120,17 @@ def get_module_memory(pid, needle):
         base = os.path.basename(path).lower()
         if needle == base and ("r--p" in perms or "r-xp" in perms):
             size = end - start
-            with open(f"/proc/{pid}/mem", "rb") as mem_file:
-                mem_file.seek(start)
-                return mem_file.read(size)
+            try:
+                return _process_vm_read(pid, start, size)
+            except OSError:
+                # Fall back to empty on failure; callers handle None/empty
+                return None
     return None
 
 
-# -------- safe /proc/pid/mem read --------
-def pread_mem(pid, addr, size):
-    fd = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
-    try:
-        return os.pread(fd, size, addr)
-    finally:
-        os.close(fd)
+# -------- safe remote read (process_vm_readv) --------
+def pread_mem(pid: int, addr: int, size: int) -> bytes:
+    return _process_vm_read(pid, addr, size)
 
 
 # -------- pointer chain --------
@@ -222,8 +236,6 @@ def find_variable_value(
         return None
 
     try:
-        # 1) Attach so /proc/<pid>/mem reads don’t EIO
-        ptrace_attach(pid)
 
         # 2) Resolve base address
         # Default to main module '<process_name>.exe' if not provided
@@ -262,8 +274,3 @@ def find_variable_value(
         elif e.errno in (errno.EPERM, errno.EACCES):
             print("Permission denied: need root, CAP_SYS_PTRACE, or ptrace_scope=0.")
         return None
-    finally:
-        try:
-            ptrace_detach(pid)
-        except Exception:
-            pass

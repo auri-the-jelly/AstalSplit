@@ -7,11 +7,9 @@ import hashlib
 from typing import Optional
 from pathlib import Path
 
-from aslrunner.proc_utils import (
+from proc_utils import (
     find_wine_process,
     iter_maps as _iter_maps,
-    ptrace_attach,
-    ptrace_detach,
     pread_mem,
     is_64_bit,
     get_all_modules,
@@ -150,8 +148,6 @@ class DeltarunePlugin:
             except Exception:
                 return
 
-        # Attach once for a stable read
-        ptrace_attach(self.pid)
         try:
             data = self._read_mem(start, size)
             if not data:
@@ -204,16 +200,14 @@ class DeltarunePlugin:
             self._module_start = start
             self._module_end = end
             self._scanned = True
-        finally:
-            ptrace_detach(self.pid)
+        except:
+            return
 
     def initialize(self, interpreter):
         # Parse ASL init block for signature patterns and offsets
         try:
             here = os.path.dirname(__file__)
-            asl_path = os.path.normpath(
-                os.path.join(here, "..", "..", "aslrunner", "Deltarune.asl")
-            )
+            asl_path = os.path.normpath(os.path.join(here, "..", "..", "Deltarune.asl"))
             with open(asl_path, "r", encoding="utf-8") as f:
                 txt = f.read()
         except Exception:
@@ -222,7 +216,6 @@ class DeltarunePlugin:
 
         pattern = re.compile(
             r"""
-            (?ms)
             (?:^|;)\s*
             (?P<lhs>(?:IntPtr|var)\s+)?(?P<name>(?:vars\.)?[A-Za-z_][A-Za-z0-9_]*)\s*=\s*vars\.x64\s*\?\s*
             (?P<fn64>[A-Za-z_][A-Za-z0-9_\.]*)\s*\(\s*(?P<off64>\d+)\s*,\s*\"(?P<sig64>[^\"]+)\"\s*\)\s*:\s*
@@ -268,8 +261,6 @@ class DeltarunePlugin:
         if not (self._ptrs.get("array") and self._ptrs.get("roomid")):
             return
 
-        # Read current room and name
-        ptrace_attach(self.pid)
         try:
             room_id = self._read_i32(self._ptrs["roomid"])
             arr_main = self._read_ptr(self._ptrs["array"])
@@ -288,5 +279,6 @@ class DeltarunePlugin:
 
             interpreter.current["room"] = room_id
             interpreter.current["roomName"] = room_name
-        finally:
-            ptrace_detach(self.pid)
+
+        except:
+            pass

@@ -102,7 +102,7 @@ def get_module_memory(pid, needle):
     needle = needle.lower()
     for start, end, perms, path in iter_maps(pid):
         base = os.path.basename(path).lower()
-        if module_name == base and ("r--p" in perms or "r-xp" in perms):
+        if needle == base and ("r--p" in perms or "r-xp" in perms):
             size = end - start
             with open(f"/proc/{pid}/mem", "rb") as mem_file:
                 mem_file.seek(start)
@@ -210,12 +210,14 @@ def find_variable_value(
     offsets: list[int],
     module_name: str = "",
     var_type: str = "string256",
+    pid: int = None,
 ):
-    pid = (
-        find_wine_process(process_name)[0]["pid"]
-        if find_wine_process(process_name)
-        else None
-    )
+    if not pid:
+        pid = (
+            find_wine_process(process_name)[0]["pid"]
+            if find_wine_process(process_name)
+            else None
+        )
     if not pid:
         return None
 
@@ -256,9 +258,10 @@ def find_variable_value(
             print(
                 "EIO while reading mem: usually unmapped address or not properly attached."
             )
+
         elif e.errno in (errno.EPERM, errno.EACCES):
             print("Permission denied: need root, CAP_SYS_PTRACE, or ptrace_scope=0.")
-        raise
+        return None
     finally:
         try:
             ptrace_detach(pid)

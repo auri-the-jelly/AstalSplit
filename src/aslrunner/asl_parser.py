@@ -209,6 +209,9 @@ class ASLInterpreter(GObject.Object):
             self.i += 1
 
     def state_update(self):
+        if self._early_exit_update:
+            self._early_exit_update = False
+            return True
         for state in self.states:
             if not self.modules.process and ASLModule(state.process_name).process:
                 self.modules = ASLModule(state.process_name)

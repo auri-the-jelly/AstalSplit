@@ -3,7 +3,7 @@ import math
 import time
 import re
 import ast
-from datetime import datetime
+from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from gi.repository import GObject, GLib, Gio, Gtk
@@ -18,6 +18,56 @@ from proc_utils import (
 from game_plugins import load_plugin
 
 # endregion
+
+
+class TimerPhase:
+    NotRunning = 0
+    Running = 1
+    Paused = 2
+    Ended = 3
+
+
+class TimingMethod:
+    RealTime = 0
+    GameTime = 1
+
+
+class Run:
+    Offset = 0
+
+
+class DummyTimer:
+    """Lightweight stand-in for LiveSplit's timer interface used in ASL.
+
+    Only holds data fields that ASL scripts may read/set. No behavior.
+    """
+
+    def __init__(self):
+        # Attempt timing
+        self.AttemptStarted: datetime | None = None
+        self.AttemptEnded: datetime | None = None
+
+        # Start timestamps
+        self.AdjustedStartTime: datetime | None = None
+        self.StartTimeWithOffset: datetime | None = None
+        self.StartTime: datetime | None = None
+
+        # Pause tracking
+        self.TimePausedAt: timedelta = timedelta(0)
+        self.GameTimePauseTime: timedelta | None = None
+        self.IsGameTimePaused: bool = False
+
+        # State/config
+        self.CurrentPhase: int = TimerPhase.NotRunning
+        self.CurrentComparison: str = "Current Comparison"
+        self.CurrentTimingMethod: int = TimingMethod.RealTime
+        self.CurrentHotkeyProfile: str = "Default"
+
+        class _Run:
+            def __init__(self):
+                self.Offset: timedelta = timedelta(0)
+
+        self.Run = _Run()
 
 
 class ASLModule(GObject.Object):
@@ -162,6 +212,12 @@ class ASLInterpreter(GObject.Object):
         self.plugin = None
         self.initialized = False
         self._early_exit_update = False
+        self._action_return_set = False
+        self._action_return = None
+        # Expose a dummy timer for ASL access
+        self.timer = DummyTimer()
+        self._has_started = False
+        GLib.timeout_add(50.0 / 3.0, self.state_update)
         # endregion
         # region Initialization
         self.startup()
@@ -181,52 +237,134 @@ class ASLInterpreter(GObject.Object):
                 except Exception:
                     self.plugin = None
 
-        GLib.timeout_add(50.0 / 3.0, self.state_update)
-
-    def update_func(self):
-        # Find and isolate the 'update' block, then execute only its inner lines.
+    def _extract_block(self, header: str) -> list[str]:
+        """Return inner lines of the first block with the given header token, else []."""
         self.i = 0
         n = len(self.asl_script)
-        update_vars = {}
-
-        def extract_block_after(idx: int) -> tuple[int, list[str]]:
-            i = idx
-            # Move to the first '{'
-            while i < n and "{" not in self.asl_script[i]:
-                i += 1
-            if i >= n:
-                return i, []
-            # Collect balanced block starting from the line with '{'
-            depth = 0
-            block: list[str] = []
-            while i < n:
-                line = self.asl_script[i]
-                depth += line.count("{")
-                block.append(line)
-                i += 1
-                depth -= line.count("}")
-                if depth <= 0:
-                    break
-            # inner between first '{' and its matching '}'
-            start_in = 0
-            for k, s in enumerate(block):
-                if "{" in s:
-                    start_in = k + 1
-                    break
-            end_in = max(start_in, len(block) - 1)
-            inner = block[start_in:end_in]
-            return i, inner
-
+        # Find header
         while self.i < n:
             line = self.asl_script[self.i].strip()
-            if line.startswith("update"):
-                next_i, inner_lines = extract_block_after(self.i + 1)
-                # Execute only inside the update block
-                self._exec_lines(inner_lines, update_vars)
-                # Move index to end of the block and stop
-                self.i = next_i
+            if line == header:
                 break
             self.i += 1
+        if self.i >= n:
+            return []
+        # Move to first '{'
+        self.i += 1
+        while self.i < n and "{" not in self.asl_script[self.i]:
+            self.i += 1
+        if self.i >= n:
+            return []
+        # Collect balanced block
+        depth = 0
+        block: list[str] = []
+        while self.i < n:
+            line = self.asl_script[self.i]
+            depth += line.count("{")
+            block.append(line)
+            self.i += 1
+            depth -= line.count("}")
+            if depth <= 0:
+                break
+        # Extract inner
+        start_in = 0
+        for k, s in enumerate(block):
+            if "{" in s:
+                start_in = k + 1
+                break
+        end_in = max(start_in, len(block) - 1)
+        return block[start_in:end_in]
+
+    class _SettingsProxy:
+        def __init__(self, settings: "ASLSettings"):
+            self._settings = settings
+
+        def __getitem__(self, key: str):
+            try:
+                meta = self._settings.settings.get(key)
+                if meta is None:
+                    return False
+                return bool(meta.get("value", False))
+            except Exception:
+                return False
+
+    def update_func(self) -> bool:
+        """Run the update block and return False if it returns false; else True.
+
+        Returning False indicates subsequent timer-control actions should be skipped,
+        consistent with ASL documentation.
+        """
+        self._action_return_set = False
+        self._action_return = None
+        inner_lines = self._extract_block("update")
+        if not inner_lines:
+            return True
+        self._exec_lines(inner_lines, {})
+        # If update explicitly returned a boolean, use it, else default to True
+        if self._action_return_set:
+            return bool(self._action_return)
+        return True
+
+    def start_func(self) -> bool:
+        """Run the start block and return True if it requests a start."""
+        self._action_return_set = False
+        self._action_return = None
+        inner_lines = self._extract_block("start")
+        if not inner_lines:
+            return False
+        self._exec_lines(inner_lines, {})
+        return bool(self._action_return) if self._action_return_set else False
+
+    def is_loading_func(self) -> bool:
+        self._action_return_set = False
+        self._action_return = None
+        lines = self._extract_block("isLoading")
+        if not lines:
+            return False
+        self._exec_lines(lines, {})
+        return bool(self._action_return) if self._action_return_set else False
+
+    def reset_func(self) -> bool:
+        self._action_return_set = False
+        self._action_return = None
+        lines = self._extract_block("reset")
+        if not lines:
+            return False
+        self._exec_lines(lines, {})
+        return bool(self._action_return) if self._action_return_set else False
+
+    def split_func(self) -> bool:
+        self._action_return_set = False
+        self._action_return = None
+        lines = self._extract_block("split")
+        if not lines:
+            return False
+        self._exec_lines(lines, {})
+        return bool(self._action_return) if self._action_return_set else False
+
+    def game_time_func(self):
+        self._action_return_set = False
+        self._action_return = None
+        lines = self._extract_block("gameTime")
+        if not lines:
+            return None
+        self._exec_lines(lines, {})
+        return self._action_return if self._action_return_set else None
+
+    def on_start_func(self):
+        lines = self._extract_block("onStart")
+        if lines:
+            self._exec_lines(lines, {})
+
+    def on_reset_func(self):
+        lines = self._extract_block("onReset")
+        if lines:
+            self._exec_lines(lines, {})
+
+    def on_split_func(self):
+        lines = self._extract_block("onSplit")
+        if lines:
+            self._exec_lines(lines, {})
 
     def state_update(self):
         for state in self.states:
@@ -249,16 +387,44 @@ class ASLInterpreter(GObject.Object):
                         self.current[var_name] = None
 
         if self.initialized:
-            if self._early_exit_update:
-                self._early_exit_update = False
-                return True
-            self.update_func()
+            # Run update and honor an explicit 'return false;' in the bloc
             # Allow game plugin to compute additional dynamic values
             if self.plugin:
                 try:
                     self.plugin.update(self)
                 except Exception:
                     pass
+            should_continue = self.update_func()
+            if should_continue:
+                # Order of execution: start (if not started), then while running: isLoading, gameTime, reset/split
+                if self.timer.CurrentPhase == TimerPhase.NotRunning:
+                    if self.start_func():
+                        # Simulate LiveSplit starting the timer
+                        now = datetime.now()
+                        self.timer.AttemptStarted = now
+                        self.timer.StartTime = now
+                        self.timer.StartTimeWithOffset = now + self.timer.Run.Offset
+                        self.timer.CurrentPhase = TimerPhase.Running
+                        self._has_started = True
+                        # onStart event
+                        self.on_start_func()
+                elif self.timer.CurrentPhase == TimerPhase.Running:
+                    # isLoading/gameTime
+                    is_loading = self.is_loading_func()
+                    # When isLoading is true, set game time paused
+                    if isinstance(is_loading, bool):
+                        self.timer.IsGameTimePaused = is_loading
+                    _gt = self.game_time_func()
+                    # reset / split
+                    if self.reset_func():
+                        # Simulate reset
+                        self.timer.CurrentPhase = TimerPhase.NotRunning
+                        self.timer.AttemptEnded = datetime.now()
+                        self._has_started = False
+                        self.on_reset_func()
+                    else:
+                        if self.split_func():
+                            self.on_split_func()
         else:
             self.initialize()
 
@@ -351,8 +517,11 @@ class ASLInterpreter(GObject.Object):
         s = s.replace(" __NEQ__ ", " != ")
         # Methods
         s = re.sub(r"\.EndsWith\s*\(", ".endswith(", s)
+        s = re.sub(r"\.StartsWith\s*\(", ".startswith(", s)
         # obj.Contains(arg) -> (arg in obj)
         s = re.sub(r"([A-Za-z0-9_\.]+)\.Contains\s*\(([^()]+)\)", r"(\2 in \1)", s)
+        # TimeSpan.FromSeconds(x) -> timedelta(seconds=x)
+        s = re.sub(r"\bTimeSpan\.FromSeconds\s*\(", "timedelta(seconds=", s)
         # C# null
         s = re.sub(r"==\s*null", " is None", s, flags=re.IGNORECASE)
         s = re.sub(r"!=\s*null", " is not None", s, flags=re.IGNORECASE)
@@ -470,6 +639,14 @@ class ASLInterpreter(GObject.Object):
             "current": _NS(self.current, "current"),
             "old": _NS(self.old, "old"),
             "vars": _NS(self.vars, "vars"),
+            # Timer and enums for ASL conditions
+            "timer": self.timer,
+            "TimerPhase": TimerPhase,
+            "TimingMethod": TimingMethod,
+            # timedelta for TimeSpan translation
+            "timedelta": timedelta,
+            # settings indexer
+            "settings": self._SettingsProxy(self.settings),
         }
         try:
             return bool(
@@ -477,6 +654,27 @@ class ASLInterpreter(GObject.Object):
             )
         except Exception:
             return False
+
+    def _eval_value(self, expr: str):
+        """Evaluate an expression in the ASL environment and return the raw value.
+        Returns None on failure.
+        """
+        py = self._translate_expr(expr)
+        env = {
+            "version": self.version,
+            "current": self.current,
+            "old": self.old,
+            "vars": self.vars,
+            "timer": self.timer,
+            "TimerPhase": TimerPhase,
+            "TimingMethod": TimingMethod,
+            "timedelta": timedelta,
+            "settings": self._SettingsProxy(self.settings),
+        }
+        try:
+            return eval(compile(py, "<asl-expr>", "eval"), {"__builtins__": {}}, env)
+        except Exception:
+            return None
 
     def _read_block_or_single(self, start_idx: int) -> tuple[int, list[str]]:
         """Return (next_index, inner_lines) for a block or a single statement.
@@ -613,12 +811,31 @@ class ASLInterpreter(GObject.Object):
                 )
                 self._exec_lines(chosen, local_store)
                 k = j2
-                if getattr(self, "_early_exit_update", False):
+                if getattr(self, "_action_return_set", False):
                     return
                 continue
-            if s == "return false;":
-                self._early_exit_update = True
-                return
+            if s.startswith("return"):
+                # return true/false; or return <expr>; or bare return;
+                tok = s.strip().rstrip(";")
+                if tok == "return true":
+                    self._action_return_set = True
+                    self._action_return = True
+                    return
+                if tok == "return false":
+                    self._action_return_set = True
+                    self._action_return = False
+                    return
+                if tok == "return":
+                    self._action_return_set = True
+                    self._action_return = None
+                    return
+                # return <expr>
+                mret = re.match(r"^return\s+(.*)$", tok)
+                if mret:
+                    val = self._eval_value(mret.group(1).strip())
+                    self._action_return_set = True
+                    self._action_return = val
+                    return
             result = self._process_simple_statement_line(s, local_store)
             if result:
                 local_store.update(result)
@@ -696,7 +913,7 @@ class ASLInterpreter(GObject.Object):
                 local_store[name] = val
                 return local_store
             return None
-        # Assignments to vars.* or current.*
+        # Assignments to vars.* or current.* or timer.*
         if "=" in s and s.endswith(";"):
             lhs, rhs = s.split("=", 1)
             lhs = lhs.strip()
@@ -706,8 +923,19 @@ class ASLInterpreter(GObject.Object):
                 self.vars[lhs] = self.identify_type(rhs)
                 return
             if lhs.startswith("current."):
-                lhs = lhs.replace("current", "", 1)
-                self.current[lhs] = self.identify_type(rhs)
+                key = lhs.replace("current.", "", 1)
+                new_val = self.identify_type(rhs)
+                if key in self.current and self.current.get(key) != new_val:
+                    self.old[key] = self.current.get(key)
+                self.current[key] = new_val
+                return None
+            if lhs.startswith("timer."):
+                attr = lhs.split(".", 1)[1]
+                val = self._eval_value(rhs)
+                try:
+                    setattr(self.timer, attr, val)
+                except Exception:
+                    pass
                 return None
         # Reset call
         if "vars.resetVars()" in s:

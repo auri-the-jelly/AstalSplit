@@ -7,13 +7,23 @@ import hashlib
 from typing import Optional
 from pathlib import Path
 
-from proc_utils import (
-    find_wine_process,
-    iter_maps as _iter_maps,
-    pread_mem,
-    is_64_bit,
-    get_all_modules,
-)
+# Prefer package-relative imports; fall back when run directly
+try:
+    from ...proc_utils import (
+        find_wine_process,
+        iter_maps as _iter_maps,
+        pread_mem,
+        is_64_bit,
+        get_all_modules,
+    )
+except Exception:  # pragma: no cover
+    from proc_utils import (
+        find_wine_process,
+        iter_maps as _iter_maps,
+        pread_mem,
+        is_64_bit,
+        get_all_modules,
+    )
 
 
 class SigScanner:
@@ -72,12 +82,20 @@ class DeltarunePlugin:
     def _iter_main_module(self):
         if not self.pid:
             return None
-        # Choose the first .exe mapping with r-xp or r--p perms
+        # Prefer mapping that matches the process name (e.g., DELTARUNE.exe)
+        preferred = f"{self.process_name.lower()}.exe"
+        fallback = None
+        pls_help = []
         for start, end, perms, path in _iter_maps(self.pid):
             base = os.path.basename(path).lower()
-            if base.endswith(".exe") and ("r-xp" in perms or "r--p" in perms):
-                return (start, end, perms, path)
-        return None
+            if base == preferred and ("r" in perms):
+                pls_help.append((start, end, perms, path))
+            if fallback is None and base.endswith(".exe") and ("r" in perms):
+                fallback = (start, end, perms, path)
+        # If no exact match was found, fall back to the first executable mapping
+        if not pls_help and fallback:
+            return [fallback]
+        return pls_help
 
     def _read_mem(self, addr: int, size: int) -> bytes:
         if not self.pid:
@@ -130,78 +148,197 @@ class DeltarunePlugin:
         return -1
 
     def _ensure_scanned(self):
-        if self._scanned:
+        # Only consider scanning complete when both pointers are found.
+        if self._scanned and self._ptrs.get("array") and self._ptrs.get("roomid"):
             return
         self._refresh_pid()
         if not self.pid:
             return
 
-        mod = self._iter_main_module()
-        if not mod:
-            return
-        start, end, perms, path = mod
-        size = end - start
-        # Ensure ASL signatures are loaded
-        if self._asl_sigs is None:
+        def _try_scan_region(start, end, perms, path):
+            size = end - start
+            mod_name = os.path.basename(path) if path else "<anon>"
+            print(
+                f"[DeltarunePlugin] Scanning {mod_name} [{hex(start)}-{hex(end)}], size={size}"
+            )
+            # Ensure ASL signatures are loaded
+            if self._asl_sigs is None:
+                try:
+                    self.initialize(None)
+                except Exception:
+                    return False
+
+            # Robust, chunked reader to avoid EFAULT (bad address) on huge/guarded regions
+            def _scan_pattern_in_region(sig: str, offset: int) -> int:
+                if not sig:
+                    return -1
+                needle = self._parse_pattern(sig)
+                pat_len = len(needle)
+                chunk = 1024 * 1024  # 1 MiB
+                prev_tail = b""
+                pos = start
+                while pos < end:
+                    want = min(chunk, end - pos)
+                    try:
+                        cur = self._read_mem(pos, want)
+                    except OSError:
+                        # skip unreadable window; reset overlap
+                        prev_tail = b""
+                        pos += want
+                        continue
+                    if not cur:
+                        prev_tail = b""
+                        pos += want
+                        continue
+                    buf = prev_tail + cur
+                    idx = self._scan_first(buf, needle)
+                    if idx >= 0:
+                        # absolute index relative to region start
+                        abs_idx = (pos - len(prev_tail)) - start + idx
+                        return abs_idx + int(offset)
+                    # keep overlap to handle cross-boundary matches
+                    if pat_len > 1:
+                        prev_tail = buf[-(pat_len - 1) :]
+                    else:
+                        prev_tail = b""
+                    pos += len(cur)
+                return -1
+
             try:
-                self.initialize(None)
+                asl_sigs = self._asl_sigs
+
+                # ptrRoomArray
+                if asl_sigs is None or "ptrRoomArray" not in asl_sigs:
+                    return False
+                found_array = False
+                off64 = asl_sigs["ptrRoomArray"].get("x64", {}).get("off")
+                sig64 = asl_sigs["ptrRoomArray"].get("x64", {}).get("sig")
+                if off64 is not None and sig64:
+                    rel = _scan_pattern_in_region(sig64, off64)
+                    if rel >= 0:
+                        addr = start + rel
+                        disp = self._read_i32(addr)
+                        self._ptrs["array"] = addr + disp + 0x4
+                        self.ptr64 = True
+                        found_array = True
+                        print(
+                            f"[DeltarunePlugin] ptrRoomArray slot @ 0x{self._ptrs['array']:X} (x64)"
+                        )
+                if not found_array:
+                    off32 = asl_sigs["ptrRoomArray"].get("x86", {}).get("off")
+                    sig32 = asl_sigs["ptrRoomArray"].get("x86", {}).get("sig")
+                    if off32 is not None and sig32:
+                        rel = _scan_pattern_in_region(sig32, off32)
+                        if rel >= 0:
+                            addr = start + rel
+                            raw = self._read_mem(addr, 4)
+                            if len(raw) == 4:
+                                self._ptrs["array"] = struct.unpack("<I", raw)[0]
+                                self.ptr64 = False
+                                found_array = True
+                                print(
+                                    f"[DeltarunePlugin] ptrRoomArray slot @ 0x{self._ptrs['array']:X} (x86)"
+                                )
+                if not found_array:
+                    print(
+                        f"[DeltarunePlugin] ptrRoomArray pattern not found in module {mod_name}"
+                    )
+
+                # ptrRoomID
+                if asl_sigs is None or "ptrRoomID" not in asl_sigs:
+                    return False
+                found_roomid = False
+                off64 = asl_sigs["ptrRoomID"].get("x64", {}).get("off")
+                sig64 = asl_sigs["ptrRoomID"].get("x64", {}).get("sig")
+                if off64 is not None and sig64:
+                    rel = _scan_pattern_in_region(sig64, off64)
+                    if rel >= 0:
+                        addr = start + rel
+                        disp = self._read_i32(addr)
+                        self._ptrs["roomid"] = addr + disp + 0x4
+                        self.ptr64 = True
+                        found_roomid = True
+                        print(
+                            f"[DeltarunePlugin] ptrRoomID slot @ 0x{self._ptrs['roomid']:X} (x64)"
+                        )
+                if not found_roomid:
+                    off32 = asl_sigs["ptrRoomID"].get("x86", {}).get("off")
+                    sig32 = asl_sigs["ptrRoomID"].get("x86", {}).get("sig")
+                    if off32 is not None and sig32:
+                        rel = _scan_pattern_in_region(sig32, off32)
+                        if rel >= 0:
+                            addr = start + rel
+                            raw = self._read_mem(addr, 4)
+                            if len(raw) == 4:
+                                self._ptrs["roomid"] = struct.unpack("<I", raw)[0]
+                                self.ptr64 = False
+                                found_roomid = True
+                                print(
+                                    f"[DeltarunePlugin] ptrRoomID slot @ 0x{self._ptrs['roomid']:X} (x86)"
+                                )
+                if not found_roomid:
+                    print(
+                        f"[DeltarunePlugin] ptrRoomID pattern not found in module {mod_name}"
+                    )
+
+                self._module_start = start
+                self._module_end = end
+                if self._ptrs.get("array") and self._ptrs.get("roomid"):
+                    self._scanned = True
+                    return True
+            except OSError as e:
+                print(f"[DeltarunePlugin] Memory read error: {e}")
+            return False
+
+        # 1) Try the main executable mappings (preferred)
+        for mod in self._iter_main_module():
+            if not mod:
+                continue
+            # Scan the main executable mapping
+            if _try_scan_region(*mod):
+                return
+            # Additionally, scan anonymous executable region(s) immediately after it
+            try:
+                _, mod_end, _, _ = mod
+                # Look ahead for the first anonymous r-xp region that starts at or just after the main module
+                for start, end, perms, path in _iter_maps(self.pid):
+                    if path:
+                        continue
+                    if "r" not in perms or "x" not in perms:
+                        continue
+                    # Heuristic: within 0x200000 bytes after main module end
+                    if start >= mod_end and (start - mod_end) <= 0x200000:
+                        if _try_scan_region(start, end, perms, path):
+                            return
+                        # Only try the first such region
+                        break
             except Exception:
-                return
+                pass
 
+        # 2) Fallback: scan all .exe/.dll modules until found
         try:
-            data = self._read_mem(start, size)
-            if not data:
-                return
-
-            asl_sigs = self._asl_sigs
-
-            # ptrRoomArray -> store address of the slot that holds the pointer to the array
-            if self.ptr64:
-                if asl_sigs is None or "ptrRoomArray" not in asl_sigs:
-                    return  # require ASL-provided signatures; no hardcoded fallbacks
-                off = asl_sigs["ptrRoomArray"]["x64"]["off"]
-                pat = self._parse_pattern(asl_sigs["ptrRoomArray"]["x64"]["sig"])
-                idx = self._scan_first(data, pat)
-                if idx >= 0:
-                    addr = start + idx + off
-                    disp = self._read_i32(addr)
-                    self._ptrs["array"] = addr + disp + 0x4
-            else:
-                if asl_sigs is None or "ptrRoomArray" not in asl_sigs:
+            for m in get_all_modules(self.pid):
+                base = os.path.basename(m["path"]).lower()
+                if not (base.endswith(".exe") or base.endswith(".dll")):
+                    continue
+                if "r" not in m["perms"]:
+                    continue
+                if _try_scan_region(m["start"], m["end"], m["perms"], m["path"]):
                     return
-                off = asl_sigs["ptrRoomArray"]["x86"]["off"]
-                pat = self._parse_pattern(asl_sigs["ptrRoomArray"]["x86"]["sig"])
-                idx = self._scan_first(data, pat)
-                if idx >= 0:
-                    addr = start + idx + off
-                    self._ptrs["array"] = self._read_ptr(addr)
+        except Exception:
+            pass
 
-            # ptrRoomID -> store address of the slot that holds the current room id
-            if self.ptr64:
-                if asl_sigs is None or "ptrRoomID" not in asl_sigs:
+        # 3) Last resort: scan anonymous executable mappings (no path)
+        try:
+            for start, end, perms, path in _iter_maps(self.pid):
+                if path:
+                    continue
+                if "r" not in perms or "x" not in perms:
+                    continue
+                if _try_scan_region(start, end, perms, path):
                     return
-                off = asl_sigs["ptrRoomID"]["x64"]["off"]
-                pat = self._parse_pattern(asl_sigs["ptrRoomID"]["x64"]["sig"])
-                idx = self._scan_first(data, pat)
-                if idx >= 0:
-                    addr = start + idx + off
-                    disp = self._read_i32(addr)
-                    self._ptrs["roomid"] = addr + disp + 0x4
-            else:
-                if asl_sigs is None or "ptrRoomID" not in asl_sigs:
-                    return
-                off = asl_sigs["ptrRoomID"]["x86"]["off"]
-                pat = self._parse_pattern(asl_sigs["ptrRoomID"]["x86"]["sig"])
-                idx = self._scan_first(data, pat)
-                if idx >= 0:
-                    addr = start + idx + off
-                    self._ptrs["roomid"] = self._read_ptr(addr)
-
-            self._module_start = start
-            self._module_end = end
-            self._scanned = True
-        except:
-            return
+        except Exception:
+            pass
 
     def initialize(self, interpreter):
         # Parse ASL init block for signature patterns and offsets
@@ -210,18 +347,23 @@ class DeltarunePlugin:
             asl_path = os.path.normpath(os.path.join(here, "..", "..", "Deltarune.asl"))
             with open(asl_path, "r", encoding="utf-8") as f:
                 txt = f.read()
-        except Exception:
+        except Exception as e:
+            print(f"[DeltarunePlugin] Failed to read ASL file: {e}")
             self._asl_sigs = None
             return
 
+        # Robust, whitespace-insensitive capture of lines like:
+        #   IntPtr ptrRoomArray = vars.x64 ? scan(5, "AA BB ?? CC") : scan(2, "...");
+        #   vars.ptrRoomID = vars.x64 ? scan(6, "...") : scan(2, "...");
         pattern = re.compile(
             r"""
-            (?:^|;)\s*
-            (?P<lhs>(?:IntPtr|var)\s+)?(?P<name>(?:vars\.)?[A-Za-z_][A-Za-z0-9_]*)\s*=\s*vars\.x64\s*\?\s*
-            (?P<fn64>[A-Za-z_][A-Za-z0-9_\.]*)\s*\(\s*(?P<off64>\d+)\s*,\s*\"(?P<sig64>[^\"]+)\"\s*\)\s*:\s*
-            (?P<fn32>[A-Za-z_][A-Za-z0-9_\.]*)\s*\(\s*(?P<off32>\d+)\s*,\s*\"(?P<sig32>[^\"]+)\"\s*\)\s*;
+            (?:^|;)\s*                                            # start of statement
+            (?: (?P<lhs>(?:IntPtr|var)) \s+ )?                    # optional type
+            (?P<name>(?:vars\.)?[A-Za-z_][A-Za-z0-9_]*) \s* = \s* vars\.x64 \s* \? \s*
+            (?P<fn64>[A-Za-z_][A-Za-z0-9_\.]*) \s* \( \s* (?P<off64>\d+) \s* , \s* " (?P<sig64>[^"]+) " \s* \) \s* : \s*
+            (?P<fn32>[A-Za-z_][A-Za-z0-9_\.]*) \s* \( \s* (?P<off32>\d+) \s* , \s* " (?P<sig32>[^"]+) " \s* \) \s* ;
             """,
-            re.M | re.S,
+            re.M | re.S | re.X,
         )
 
         results: dict[str, dict] = {}
@@ -237,6 +379,12 @@ class DeltarunePlugin:
                 continue
 
         self._asl_sigs = results or None
+        # Helpful debug output so we know whether signatures were parsed
+        if self._asl_sigs:
+            parsed = ", ".join(sorted(self._asl_sigs.keys()))
+            print(f"[DeltarunePlugin] Parsed ASL signatures: {parsed}")
+        else:
+            print("[DeltarunePlugin] No ASL signatures parsed")
 
         game_hash = ""
         try:
@@ -280,5 +428,5 @@ class DeltarunePlugin:
             interpreter.current["room"] = room_id
             interpreter.current["roomName"] = room_name
 
-        except:
+        except Exception as e:
             pass

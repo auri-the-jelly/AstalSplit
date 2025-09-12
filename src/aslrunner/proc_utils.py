@@ -98,7 +98,11 @@ def get_module_base(pid, needle):
     needle = (needle or "").lower()
     for start, end, perms, path in iter_maps(pid):
         base = os.path.basename(path).lower()
-        if needle and needle in base and ("r--p" in perms or "r-xp" in perms):
+        if (
+            needle
+            and needle in base
+            and ("r--p" in perms or "r-xp" in perms or "rw-p" in perms)
+        ):
             return start
     return None
 
@@ -107,7 +111,7 @@ def get_all_modules(pid):
     modules = []
     for start, end, perms, path in iter_maps(pid):
         base = os.path.basename(path).lower()
-        if ".exe" in base or ".dll" in base:
+        if ".exe" in base:
             modules.append({"start": start, "end": end, "perms": perms, "path": path})
     return modules
 

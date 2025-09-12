@@ -648,7 +648,7 @@ init
     };
 
     IntPtr ptrRoomArray = vars.x64
-        ? scan(5, "74 0C 48 8B 05 ?? ?? ?? ?? 48 8B 04 D0")
+        ? scan(5, "1")
         : scan(2, "8B 3D ?? ?? ?? ?? 2B EF");
 
     vars.ptrRoomID = vars.x64

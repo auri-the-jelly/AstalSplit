@@ -4,6 +4,7 @@ import time
 import re
 import ast
 from datetime import datetime, timedelta
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from gi.repository import GObject, GLib, Gio, Gtk
@@ -94,14 +95,17 @@ class ASLModule(GObject.Object):
             self.process = None
 
     def First(self):
-        return (
-            get_all_modules(self.process["pid"])[0]
-            if self.process and get_all_modules(self.process["pid"])
-            else None
-        )
+        try:
+            mods = get_all_modules(self.process["pid"]) if self.process else []
+        except Exception:
+            mods = []
+        return mods[0] if mods else None
 
     def is64Bit(self):
         return is_64_bit(self.process["pid"]) if self.process else False
+
+    # Alias PascalCase name expected by ASL scripts
+    Is64Bit = is64Bit
 
 
 class ASLState(GObject.Object):
@@ -214,6 +218,8 @@ class ASLInterpreter(GObject.Object):
         self._early_exit_update = False
         self._action_return_set = False
         self._action_return = None
+        # Lines from the ASL update block a plugin has already handled this tick
+        self._skip_update_norms: set[str] = set()
         # Expose a dummy timer for ASL access
         self.timer = DummyTimer()
         self._has_started = False
@@ -299,7 +305,19 @@ class ASLInterpreter(GObject.Object):
         inner_lines = self._extract_block("update")
         if not inner_lines:
             return True
-        self._exec_lines(inner_lines, {})
+        # If a plugin reported some lines as already handled, skip them
+        if self._skip_update_norms:
+
+            def _norm(s: str) -> str:
+                return re.sub(r"\s+", "", s.strip())
+
+            filtered = [
+                ln for ln in inner_lines if _norm(ln) not in self._skip_update_norms
+            ]
+        else:
+            filtered = inner_lines
+
+        self._exec_lines(filtered, {})
         # If update explicitly returned a boolean, use it, else default to True
         if self._action_return_set:
             return bool(self._action_return)
@@ -368,8 +386,31 @@ class ASLInterpreter(GObject.Object):
 
     def state_update(self):
         for state in self.states:
-            if not self.modules.process and ASLModule(state.process_name).process:
-                self.modules = ASLModule(state.process_name)
+            # Refresh module handle if current PID is invalid or replaced
+            try:
+                found = find_wine_process(state.process_name)
+            except Exception:
+                found = []
+
+            if self.modules and getattr(self.modules, "process", None):
+                cur_pid = (
+                    self.modules.process.get("pid") if self.modules.process else None
+                )
+                cur_alive = bool(cur_pid) and os.path.exists(f"/proc/{cur_pid}")
+                same_in_found = bool(cur_pid) and any(
+                    p.get("pid") == cur_pid for p in found
+                )
+                # If pid not alive or not among matching processes, try to switch
+                if not cur_alive or not same_in_found:
+                    if found:
+                        self.modules = ASLModule(state.process_name)
+                    else:
+                        # No matching process currently; clear modules
+                        self.modules = ASLModule()
+            else:
+                # No modules yet; attach if a matching process exists
+                if found:
+                    self.modules = ASLModule(state.process_name)
             if state.version == self.version:
                 for var_name, meta in state.variables.items():
                     try:
@@ -391,10 +432,23 @@ class ASLInterpreter(GObject.Object):
             # Allow game plugin to compute additional dynamic values
             if self.plugin:
                 try:
-                    self.plugin.update(self)
+                    skipped = self.plugin.update(self)
+                    # Accept a list of raw ASL lines that the plugin handled already
+                    self._skip_update_norms.clear()
+                    if isinstance(skipped, (list, tuple)):
+                        # Normalize by stripping whitespace for robust matching
+                        for s in skipped:
+                            try:
+                                key = re.sub(r"\s+", "", str(s).strip())
+                                if key:
+                                    self._skip_update_norms.add(key)
+                            except Exception:
+                                continue
                 except Exception:
                     pass
             should_continue = self.update_func()
+            # Clear per-tick skips after running update
+            self._skip_update_norms.clear()
             if should_continue:
                 # Order of execution: start (if not started), then while running: isLoading, gameTime, reset/split
                 if self.timer.CurrentPhase == TimerPhase.NotRunning:
@@ -429,6 +483,7 @@ class ASLInterpreter(GObject.Object):
             self.initialize()
 
         # Returning True keeps the GLib timeout running
+        print(self.current.get("namerEvent", 0))
         return True
 
     def initialize(self):
@@ -508,7 +563,14 @@ class ASLInterpreter(GObject.Object):
         s = expr.strip().rstrip(",")
         # Convert C# verbatim strings @"..." to Python-safe quoted strings
         s = self._replace_verbatim_strings(s)
+        # Handle explicit C#-style casts, e.g. (int)x, (double)(a+b)
+        s = self._replace_explicit_casts(s)
+        # Translate dot lookups on ASL state dictionaries to Python index syntax
+        s = self._replace_state_access(s)
         # Protect '!=' during replacements
+        s = s.replace("true", "True")
+        s = s.replace("false", "False")
+        s = s.replace("null", "None")
         s = s.replace("!=", " __NEQ__ ")
         s = s.replace("&&", " and ")
         s = s.replace("||", " or ")
@@ -522,6 +584,15 @@ class ASLInterpreter(GObject.Object):
         s = re.sub(r"([A-Za-z0-9_\.]+)\.Contains\s*\(([^()]+)\)", r"(\2 in \1)", s)
         # TimeSpan.FromSeconds(x) -> timedelta(seconds=x)
         s = re.sub(r"\bTimeSpan\.FromSeconds\s*\(", "timedelta(seconds=", s)
+        # Convert.ToXxx(x) -> python builtins
+        s = re.sub(r"\bConvert\.ToInt32\s*\(", "int(", s)
+        s = re.sub(r"\bConvert\.ToUInt32\s*\(", "int(", s)
+        s = re.sub(r"\bConvert\.ToInt64\s*\(", "int(", s)
+        s = re.sub(r"\bConvert\.ToUInt64\s*\(", "int(", s)
+        s = re.sub(r"\bConvert\.ToDouble\s*\(", "float(", s)
+        s = re.sub(r"\bConvert\.ToSingle\s*\(", "float(", s)
+        s = re.sub(r"\bConvert\.ToBoolean\s*\(", "bool(", s)
+        s = re.sub(r"\bConvert\.ToString\s*\(", "str(", s)
         # C# null
         s = re.sub(r"==\s*null", " is None", s, flags=re.IGNORECASE)
         s = re.sub(r"!=\s*null", " is not None", s, flags=re.IGNORECASE)
@@ -530,6 +601,199 @@ class ASLInterpreter(GObject.Object):
         if "?" in s and ":" in s:
             s = self._convert_ternary(s)
         return s
+
+    def _replace_state_access(self, s: str) -> str:
+        """Convert current.foo -> current["foo"] for special ASL state dicts."""
+
+        targets = {"current", "old", "vars"}
+        out: list[str] = []
+        i = 0
+        n = len(s)
+        in_str = False
+        str_ch = ""
+
+        while i < n:
+            ch = s[i]
+            if in_str:
+                out.append(ch)
+                if ch == str_ch and (i == 0 or s[i - 1] != "\\"):
+                    in_str = False
+                i += 1
+                continue
+
+            if ch in ('"', "'"):
+                in_str = True
+                str_ch = ch
+                out.append(ch)
+                i += 1
+                continue
+
+            matched = False
+            for name in targets:
+                name_len = len(name)
+                if s.startswith(name, i) and (
+                    i == 0 or not s[i - 1].isalnum() and s[i - 1] != "_"
+                ):
+                    j = i + name_len
+                    k = j
+                    while k < n and s[k].isspace():
+                        k += 1
+                    if k < n and s[k] == ".":
+                        k += 1
+                        while k < n and s[k].isspace():
+                            k += 1
+                        ident_start = k
+                        if k < n and (s[k].isalpha() or s[k] == "_"):
+                            k += 1
+                            while k < n and (s[k].isalnum() or s[k] == "_"):
+                                k += 1
+                            ident = s[ident_start:k]
+                            out.append(f'{name}["{ident}"]')
+                            i = k
+                            matched = True
+                            break
+                if matched:
+                    break
+
+            if matched:
+                continue
+
+            out.append(ch)
+            i += 1
+
+        return "".join(out)
+
+    def _replace_explicit_casts(self, s: str) -> str:
+        """Replace C#-style casts like (int)x with Python calls int(x).
+
+        Heuristics:
+        - Recognizes numeric and basic types: sbyte, byte, short, ushort, int, uint, long,
+          ulong, float, double, bool, string.
+        - If the cast is followed by a parenthesized expression, converts (T)(expr) -> T(expr).
+        - Otherwise, converts the next primary expression (identifier/property chain with
+          optional call/index) into a function argument.
+        """
+        type_map = {
+            "sbyte": "int",
+            "byte": "int",
+            "short": "int",
+            "ushort": "int",
+            "int": "int",
+            "uint": "int",
+            "long": "int",
+            "ulong": "int",
+            "float": "float",
+            "double": "float",
+            "bool": "bool",
+            "string": "str",
+        }
+
+        out = []
+        i = 0
+        n = len(s)
+        in_str = False
+        str_ch = ""
+        while i < n:
+            ch = s[i]
+            # Track quoted strings to avoid replacing inside
+            if in_str:
+                out.append(ch)
+                if ch == str_ch and (i == 0 or s[i - 1] != "\\"):
+                    in_str = False
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_str = True
+                str_ch = ch
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                # Try to parse a cast type
+                j = i + 1
+                while j < n and s[j].isspace():
+                    j += 1
+                k = j
+                while k < n and (s[k].isalpha()):
+                    k += 1
+                tname = s[j:k]
+                while k < n and s[k].isspace():
+                    k += 1
+                if k < n and s[k] == ")" and tname in type_map:
+                    # Found a cast. Now parse the following primary expression
+                    func = type_map[tname]
+                    m = k + 1
+                    while m < n and s[m].isspace():
+                        m += 1
+                    if m < n and s[m] == "(":
+                        # Cast of a parenthesized expression: (T)( ... )
+                        depth = 0
+                        p = m
+                        while p < n:
+                            if s[p] == "(":
+                                depth += 1
+                            elif s[p] == ")":
+                                depth -= 1
+                                if depth == 0:
+                                    break
+                            p += 1
+                        if p < n:
+                            inner = s[m + 1 : p]
+                            out.append(f"{func}((" + inner + "))")
+                            i = p + 1
+                            continue
+                    # Otherwise capture a primary: identifier/chain with calls and indexing
+                    p = m
+                    # First part must start with identifier or keyword like current/vars
+                    if p < n and (s[p].isalpha() or s[p] == "_"):
+                        # Consume identifier and subsequent .ident, [..], (..)
+                        while p < n:
+                            if s[p].isalnum() or s[p] in "_":
+                                p += 1
+                                continue
+                            if s[p] == ".":
+                                p += 1
+                                continue
+                            if s[p] == "(":  # consume call
+                                depth = 0
+                                q = p
+                                while q < n:
+                                    if s[q] == "(":
+                                        depth += 1
+                                    elif s[q] == ")":
+                                        depth -= 1
+                                        if depth == 0:
+                                            q += 1
+                                            break
+                                    q += 1
+                                p = q
+                                continue
+                            if s[p] == "[":  # consume indexing
+                                depth = 0
+                                q = p
+                                while q < n:
+                                    if s[q] == "[":
+                                        depth += 1
+                                    elif s[q] == "]":
+                                        depth -= 1
+                                        if depth == 0:
+                                            q += 1
+                                            break
+                                    q += 1
+                                p = q
+                                continue
+                            break
+                        expr = s[m:p]
+                        out.append(f"{func}(" + expr + ")")
+                        i = p
+                        continue
+                # Not a cast, just emit '('
+                out.append(ch)
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
 
     def _replace_verbatim_strings(self, s: str) -> str:
         # Replace C# verbatim strings @"..." with Python-safe quoted strings
@@ -634,6 +898,13 @@ class ASLInterpreter(GObject.Object):
                     return self._d.get(f"{self._p}.{name}")
                 return None
 
+            def __getitem__(self, name):
+                if name in self._d:
+                    return self._d.get(name)
+                if self._p and f"{self._p}.{name}" in self._d:
+                    return self._d.get(f"{self._p}.{name}")
+                return None
+
         env = {
             "version": self.version,
             "current": _NS(self.current, "current"),
@@ -670,10 +941,11 @@ class ASLInterpreter(GObject.Object):
             "TimingMethod": TimingMethod,
             "timedelta": timedelta,
             "settings": self._SettingsProxy(self.settings),
+            "game": self.modules,
         }
         try:
             return eval(compile(py, "<asl-expr>", "eval"), {"__builtins__": {}}, env)
-        except Exception:
+        except Exception as e:
             return None
 
     def _read_block_or_single(self, start_idx: int) -> tuple[int, list[str]]:
@@ -729,8 +1001,8 @@ class ASLInterpreter(GObject.Object):
         self, lines: list[str], pos: int
     ) -> tuple[int, list[str]]:
         """From a local list of lines, return (next_index, inner_lines) for a block starting at pos.
-        If a '{' appears at or after pos, read a balanced block and return its inner lines;
-        otherwise return the single following line.
+        Supports braces on the same line or the previous non-empty line.
+        If no block, returns the single following line.
         """
         i2 = pos
         n2 = len(lines)
@@ -738,8 +1010,15 @@ class ASLInterpreter(GObject.Object):
             i2 += 1
         if i2 >= n2:
             return i2, []
-        if "{" in lines[i2]:
-            depth2 = 0
+
+        # Check if previous non-empty line opened a block
+        prev_idx = i2 - 1
+        while prev_idx >= 0 and lines[prev_idx].strip() == "":
+            prev_idx -= 1
+        prev_has_open = prev_idx >= 0 and ("{" in lines[prev_idx])
+
+        if prev_has_open or ("{" in lines[i2]):
+            depth2 = 1 if (prev_has_open and "{" not in lines[i2]) else 0
             block2: list[str] = []
             while i2 < n2:
                 ln = lines[i2]
@@ -751,10 +1030,11 @@ class ASLInterpreter(GObject.Object):
                     break
             # inner between first '{' and closing '}'
             start_in = 0
-            for k2, s2 in enumerate(block2):
-                if "{" in s2:
-                    start_in = k2 + 1
-                    break
+            if not prev_has_open:
+                for k2, s2 in enumerate(block2):
+                    if "{" in s2:
+                        start_in = k2 + 1
+                        break
             end_in = max(start_in, len(block2) - 1)
             return i2, block2[start_in:end_in]
         # single statement
@@ -777,38 +1057,42 @@ class ASLInterpreter(GObject.Object):
                     continue
                 cond_loc = mloc.group(1).strip()
                 k_then_end, then_lines_loc = self._consume_block_from_list(lines, k + 1)
-                # else / else if
+                # Collect zero or more else-if branches and optional final else
                 j2 = k_then_end
                 while j2 < len(lines) and lines[j2].strip() == "":
                     j2 += 1
-                else_lines_loc: list[str] = []
-                elif_cond_loc: str | None = None
-                if j2 < len(lines) and lines[j2].strip().startswith("else"):
+                elif_branches: list[tuple[str, list[str]]] = []
+                else_lines_loc: list[str] | None = None
+                while j2 < len(lines) and lines[j2].strip().startswith("else"):
                     token2 = lines[j2].strip()
-                    # Allow optional '{' and comments in nested else-if
                     m2loc = re.match(
                         r"^else\s+if\s*\((.*)\)\s*(?:\{)?\s*(?://.*)?$",
                         token2,
                     )
                     j2 += 1
+                    j2, body = self._consume_block_from_list(lines, j2)
                     if m2loc:
-                        elif_cond_loc = m2loc.group(1).strip()
-                        j2, else_lines_loc = self._consume_block_from_list(lines, j2)
+                        elif_branches.append((m2loc.group(1).strip(), body))
                     else:
-                        j2, else_lines_loc = self._consume_block_from_list(lines, j2)
+                        else_lines_loc = body
+                        break
+                    while j2 < len(lines) and lines[j2].strip() == "":
+                        j2 += 1
 
-                run_then_loc = self._eval_condition(cond_loc)
-                run_else_loc = False
-                if not run_then_loc and elif_cond_loc is not None:
-                    run_else_loc = self._eval_condition(elif_cond_loc)
-                elif not run_then_loc and else_lines_loc:
-                    run_else_loc = True
+                # Decide branch across then/elif*/else
+                chosen: list[str] = []
+                if self._eval_condition(cond_loc):
+                    chosen = then_lines_loc
+                else:
+                    matched = False
+                    for cexpr, body in elif_branches:
+                        if self._eval_condition(cexpr):
+                            chosen = body
+                            matched = True
+                            break
+                    if not matched and else_lines_loc is not None:
+                        chosen = else_lines_loc
 
-                chosen = (
-                    then_lines_loc
-                    if run_then_loc
-                    else (else_lines_loc if run_else_loc else [])
-                )
                 self._exec_lines(chosen, local_store)
                 k = j2
                 if getattr(self, "_action_return_set", False):
@@ -855,33 +1139,40 @@ class ASLInterpreter(GObject.Object):
         # Move to then body
         self.i += 1
         then_end, then_lines = self._read_block_or_single(self.i)
-        # Check for else/else if
+        # Collect zero or more else-if branches and optional final else
         j = then_end
         while j < n and self.asl_script[j].strip() == "":
             j += 1
-        else_lines: list[str] = []
-        elif_cond: str | None = None
-        if j < n and self.asl_script[j].strip().startswith("else"):
+        elif_branches: list[tuple[str, list[str]]] = []
+        else_lines: list[str] | None = None
+        while j < n and self.asl_script[j].strip().startswith("else"):
             token = self.asl_script[j].strip()
-            # Allow optional trailing '{' and end-of-line comments after else-if
             m2 = re.match(r"^else\s+if\s*\((.*)\)\s*(?:\{)?\s*(?://.*)?$", token)
             j += 1
+            j, body = self._read_block_or_single(j)
             if m2:
-                elif_cond = m2.group(1).strip()
-                j, else_lines = self._read_block_or_single(j)
+                elif_branches.append((m2.group(1).strip(), body))
             else:
-                j, else_lines = self._read_block_or_single(j)
+                else_lines = body
+                break
+            while j < n and self.asl_script[j].strip() == "":
+                j += 1
 
-        # Decide branch
-        run_then = self._eval_condition(cond)
-        run_else = False
-        if not run_then and elif_cond is not None:
-            run_else = self._eval_condition(elif_cond)
-        elif not run_then and else_lines:
-            run_else = True
+        # Decide which branch to execute
+        target: list[str] = []
+        if self._eval_condition(cond):
+            target = then_lines
+        else:
+            matched = False
+            for cexpr, body in elif_branches:
+                if self._eval_condition(cexpr):
+                    target = body
+                    matched = True
+                    break
+            if not matched and else_lines is not None:
+                target = else_lines
 
         # Execute the chosen simple lines (supports nested ifs within the extracted list)
-        target = then_lines if run_then else (else_lines if run_else else [])
         self._exec_lines(target, local_store)
 
         # Advance after processed blocks
@@ -920,11 +1211,17 @@ class ASLInterpreter(GObject.Object):
             rhs = rhs.strip().strip(";")
             if lhs.startswith("vars."):
                 lhs = lhs.replace("vars.", "", 1)
-                self.vars[lhs] = self.identify_type(rhs)
+                # Evaluate dynamic expressions (supports casts); fallback to identify_type
+                val = self._eval_value(rhs)
+                if val is None:
+                    val = self.identify_type(rhs)
+                self.vars[lhs] = val
                 return
             if lhs.startswith("current."):
                 key = lhs.replace("current.", "", 1)
-                new_val = self.identify_type(rhs)
+                new_val = self._eval_value(rhs)
+                if new_val is None:
+                    new_val = self.identify_type(rhs)
                 if key in self.current and self.current.get(key) != new_val:
                     self.old[key] = self.current.get(key)
                 self.current[key] = new_val
@@ -937,6 +1234,9 @@ class ASLInterpreter(GObject.Object):
                 except Exception:
                     pass
                 return None
+            else:
+                var_type, var_name = lhs.split(" ", 1)
+                local_store[var_name] = self.identify_type(rhs)
         # Reset call
         if "vars.resetVars()" in s:
             self.reset_vars()

@@ -54,6 +54,7 @@ class DeltarunePlugin:
         self._scanned: bool = False
         self._module_start: Optional[int] = None
         self._module_end: Optional[int] = None
+        self._main_module_base: Optional[int] = None
         # Store pointers in a dictionary: name -> address of the pointer/value slot
         # Keys used: 'array' (room name array base pointer slot), 'roomid' (current room id slot)
         self._ptrs: dict[str, Optional[int]] = {"array": None, "roomid": None}
@@ -75,6 +76,13 @@ class DeltarunePlugin:
         if procs:
             self.pid = procs[0]["pid"]
             self.ptr64 = is_64_bit(self.pid)
+            # Cache the main module base for fallback addressing (e.g., DELTARUNE.exe)
+            try:
+                mods = list(self._iter_main_module() or [])
+                if mods:
+                    self._main_module_base = mods[0][0]
+            except Exception:
+                self._main_module_base = None
         else:
             self.pid = None
 
@@ -118,6 +126,38 @@ class DeltarunePlugin:
     def _read_cstr(self, addr: int, max_len: int = 256) -> str:
         data = self._read_mem(addr, max_len)
         return data.split(b"\x00", 1)[0].decode("utf-8", "ignore")
+
+    def _addr_with_main_base(self, addr: Optional[int]) -> Optional[int]:
+        """Treat a small value as module-relative offset and add module base.
+
+        Tries both the scanning module start (`_module_start`) and the main
+        executable module base (DELTARUNE.exe), using the first applicable one.
+        """
+        if addr is None:
+            return None
+        # Ensure we have at least one candidate base
+        if self._main_module_base is None and self._module_start is None:
+            try:
+                mods = list(self._iter_main_module() or [])
+                if mods:
+                    self._main_module_base = mods[0][0]
+            except Exception:
+                self._main_module_base = None
+
+        candidates = []
+        if self._module_start is not None:
+            candidates.append(self._module_start)
+        if (
+            self._main_module_base is not None
+            and self._main_module_base != self._module_start
+        ):
+            candidates.append(self._main_module_base)
+
+        # Heuristic: if addr appears to be below any known module base, treat as offset
+        for base in candidates:
+            if addr < base:
+                return base + addr
+        return addr
 
     # -------- signature scan --------
     @staticmethod
@@ -218,12 +258,19 @@ class DeltarunePlugin:
                     if rel >= 0:
                         addr = start + rel
                         disp = self._read_i32(addr)
-                        self._ptrs["array"] = addr + disp + 0x4
-                        self.ptr64 = True
+                        candidate = addr + disp + 0x4
+                        # Do not overwrite if already found earlier (e.g., in main module)
+                        if self._ptrs["array"] is None:
+                            self._ptrs["array"] = candidate
+                            self.ptr64 = True
+                            print(
+                                f"[DeltarunePlugin] ptrRoomArray slot @ 0x{self._ptrs['array']:X} (x64)"
+                            )
+                        else:
+                            print(
+                                f"[DeltarunePlugin] ptrRoomArray already set; keeping 0x{self._ptrs['array']:X} (found also in {mod_name})"
+                            )
                         found_array = True
-                        print(
-                            f"[DeltarunePlugin] ptrRoomArray slot @ 0x{self._ptrs['array']:X} (x64)"
-                        )
                 if not found_array:
                     off32 = asl_sigs["ptrRoomArray"].get("x86", {}).get("off")
                     sig32 = asl_sigs["ptrRoomArray"].get("x86", {}).get("sig")
@@ -233,12 +280,18 @@ class DeltarunePlugin:
                             addr = start + rel
                             raw = self._read_mem(addr, 4)
                             if len(raw) == 4:
-                                self._ptrs["array"] = struct.unpack("<I", raw)[0]
-                                self.ptr64 = False
+                                candidate = struct.unpack("<I", raw)[0]
+                                if self._ptrs["array"] is None:
+                                    self._ptrs["array"] = candidate
+                                    self.ptr64 = False
+                                    print(
+                                        f"[DeltarunePlugin] ptrRoomArray slot @ 0x{self._ptrs['array']:X} (x86)"
+                                    )
+                                else:
+                                    print(
+                                        f"[DeltarunePlugin] ptrRoomArray already set; keeping 0x{self._ptrs['array']:X} (found also in {mod_name})"
+                                    )
                                 found_array = True
-                                print(
-                                    f"[DeltarunePlugin] ptrRoomArray slot @ 0x{self._ptrs['array']:X} (x86)"
-                                )
                 if not found_array:
                     print(
                         f"[DeltarunePlugin] ptrRoomArray pattern not found in module {mod_name}"
@@ -403,19 +456,35 @@ class DeltarunePlugin:
         if not self.pid:
             self._refresh_pid()
         if not self.pid:
-            return
+            return None
         if not self._scanned:
             self._ensure_scanned()
         if not (self._ptrs.get("array") and self._ptrs.get("roomid")):
-            return
+            # Fallback: if both are missing, try treating stored values as module-relative
+            # offsets if present (user request: try reading pointer with offset at main module)
+            pass
 
         try:
-            room_id = self._read_i32(self._ptrs["roomid"])
-            arr_main = self._read_ptr(self._ptrs["array"])
+            # Primary attempt: use captured addresses as-is
+            roomid_addr = self._ptrs.get("roomid")
+            array_addr = self._ptrs.get("array")
+            # array_addr = 170245D67
+            # roomid_addr = 1408B27C8
+            # Both beyond the confines of the memory map.
+            if roomid_addr is None or array_addr is None:
+                # If one is missing, try module-relative interpretation
+                roomid_addr = self._addr_with_main_base(roomid_addr)
+                array_addr = self._addr_with_main_base(array_addr)
+
+            room_id = self._read_i32(roomid_addr)
+            arr_main = self._read_ptr(array_addr)
             if arr_main == 0:
                 interpreter.current["room"] = room_id
                 interpreter.current["roomName"] = ""
-                return
+                return [
+                    "current.room = game.ReadValue<int>((IntPtr)vars.ptrRoomID);",
+                    "current.roomName = vars.getRoomName();",
+                ]
 
             stride = 8 if self.ptr64 else 4
             item_ptr_addr = arr_main + (room_id * stride)
@@ -423,10 +492,44 @@ class DeltarunePlugin:
             if item_ptr == 0:
                 room_name = ""
             else:
-                room_name = self._read_cstr(item_ptr, 64)
+                room_name = self._read_cstr(item_ptr, 128)
 
             interpreter.current["room"] = room_id
             interpreter.current["roomName"] = room_name
 
-        except Exception as e:
-            pass
+            # Inform interpreter that these two lines are handled by the plugin
+            return [
+                "current.room = game.ReadValue<int>((IntPtr)vars.ptrRoomID);",
+                "current.roomName = vars.getRoomName();",
+            ]
+
+        except Exception:
+            # Secondary attempt: treat addresses as module-relative offsets and retry
+            try:
+                roomid_addr = self._addr_with_main_base(self._ptrs.get("roomid"))
+                array_addr = self._addr_with_main_base(self._ptrs.get("array"))
+                if roomid_addr is None or array_addr is None:
+                    return None
+                room_id = self._read_i32(roomid_addr)
+                arr_main = self._read_ptr(array_addr)
+                if arr_main == 0:
+                    interpreter.current["room"] = room_id
+                    interpreter.current["roomName"] = ""
+                    return [
+                        "current.room = game.ReadValue<int>((IntPtr)vars.ptrRoomID);",
+                        "current.roomName = vars.getRoomName();",
+                    ]
+
+                stride = 8 if self.ptr64 else 4
+                item_ptr_addr = arr_main + (room_id * stride)
+                item_ptr = self._read_ptr(item_ptr_addr)
+                room_name = "" if item_ptr == 0 else self._read_cstr(item_ptr, 64)
+
+                interpreter.current["room"] = room_id
+                interpreter.current["roomName"] = room_name
+                return [
+                    "current.room = game.ReadValue<int>((IntPtr)vars.ptrRoomID);",
+                    "current.roomName = vars.getRoomName();",
+                ]
+            except Exception as e:
+                return None

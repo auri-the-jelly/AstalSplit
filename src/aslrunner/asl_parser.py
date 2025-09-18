@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from gi.repository import GObject, GLib, Gio, Gtk
 from proc_utils import (
     find_variable_value,
@@ -69,6 +70,47 @@ class DummyTimer:
                 self.Offset: timedelta = timedelta(0)
 
         self.Run = _Run()
+
+
+class _Stopwatch:
+    def __init__(self):
+        self._start: float | None = None
+        self._elapsed: float = 0.0
+
+    def Start(self):
+        if self._start is None:
+            self._start = time.monotonic()
+
+    def Stop(self):
+        if self._start is not None:
+            self._elapsed += time.monotonic() - self._start
+            self._start = None
+
+    def Reset(self):
+        self._elapsed = 0.0
+        self._start = None
+
+    @property
+    def IsRunning(self) -> bool:
+        return self._start is not None
+
+    @property
+    def ElapsedMilliseconds(self) -> int:
+        total = self._elapsed
+        if self._start is not None:
+            total += time.monotonic() - self._start
+        return int(total * 1000)
+
+
+class _HashSet(set):
+    def Add(self, item):
+        self.add(item)
+
+    def Contains(self, item):
+        return item in self
+
+    def Clear(self):
+        self.clear()
 
 
 class ASLModule(GObject.Object):
@@ -198,6 +240,18 @@ class ASLSettings:
 class ASLInterpreter(GObject.Object):
     __gtype__name__ = "ASLInterpreter"
 
+    _SAFE_EVAL_NAMES = {
+        "int": int,
+        "float": float,
+        "bool": bool,
+        "str": str,
+        "abs": abs,
+        "max": max,
+        "min": min,
+        "round": round,
+        "len": len,
+    }
+
     def __init__(self, asl_script: str):
         super().__init__()
         self.asl_path = asl_script
@@ -226,8 +280,8 @@ class ASLInterpreter(GObject.Object):
         GLib.timeout_add(50.0 / 3.0, self.state_update)
         # endregion
         # region Initialization
-        self.startup()
         self.modules = ASLModule()
+        self.startup()
         self.org = self.vars.copy()
         self.exit = self.exit_func
         self.update = self.update_func
@@ -483,7 +537,6 @@ class ASLInterpreter(GObject.Object):
             self.initialize()
 
         # Returning True keeps the GLib timeout running
-        print(self.current.get("namerEvent", 0))
         return True
 
     def initialize(self):
@@ -514,7 +567,9 @@ class ASLInterpreter(GObject.Object):
                             self.i += 1
                         # do not advance here; outer loop will increment
                     else:
-                        local_store = self._process_simple_statement_line(s, init_vars)
+                        local_store = self._process_simple_statement_line(
+                            s, init_vars, self.i
+                        )
                         if local_store:
                             init_vars.update(local_store)
                     self.i += 1
@@ -577,6 +632,8 @@ class ASLInterpreter(GObject.Object):
         # logical not: bare '!'
         s = re.sub(r"(?<![=!])!\s*", " not ", s)
         s = s.replace(" __NEQ__ ", " != ")
+        # print(...) -> _print(...)
+        s = re.sub(r"\bprint\s*\(", "_print(", s)
         # Methods
         s = re.sub(r"\.EndsWith\s*\(", ".endswith(", s)
         s = re.sub(r"\.StartsWith\s*\(", ".startswith(", s)
@@ -596,6 +653,8 @@ class ASLInterpreter(GObject.Object):
         # C# null
         s = re.sub(r"==\s*null", " is None", s, flags=re.IGNORECASE)
         s = re.sub(r"!=\s*null", " is not None", s, flags=re.IGNORECASE)
+        # Simple object replacements
+        s = re.sub(r"\bnew\s+Stopwatch\s*\(\)", "_Stopwatch()", s)
         # Already normalized verbatim strings above
         # Ternary cond ? a : b (single-level)
         if "?" in s and ":" in s:
@@ -883,8 +942,8 @@ class ASLInterpreter(GObject.Object):
         self.vars = self.org.copy()
 
     # ---- Mini statement & control-flow helpers ----
-    def _eval_condition(self, cond: str) -> bool:
-        py = self._translate_expr(cond)
+    def _eval_condition(self, cond: str, local_store: dict | None = None) -> bool:
+        py = self._translate_expr(cond).strip()
 
         class _NS:
             def __init__(self, d: dict, prefix: str | None = None):
@@ -918,7 +977,12 @@ class ASLInterpreter(GObject.Object):
             "timedelta": timedelta,
             # settings indexer
             "settings": self._SettingsProxy(self.settings),
+            "_print": self._print,
+            "_Stopwatch": _Stopwatch,
         }
+        env.update(self._SAFE_EVAL_NAMES)
+        if local_store:
+            env.update(local_store)
         try:
             return bool(
                 eval(compile(py, "<asl-if>", "eval"), {"__builtins__": {}}, env)
@@ -926,10 +990,22 @@ class ASLInterpreter(GObject.Object):
         except Exception:
             return False
 
-    def _eval_value(self, expr: str):
+    def _eval_value(
+        self,
+        expr: str,
+        local_store: dict | None = None,
+        *,
+        _allow_concat: bool = True,
+    ):
         """Evaluate an expression in the ASL environment and return the raw value.
         Returns None on failure.
         """
+
+        if local_store:
+            simple = expr.strip()
+            if simple in local_store:
+                return local_store[simple]
+
         py = self._translate_expr(expr)
         env = {
             "version": self.version,
@@ -942,11 +1018,439 @@ class ASLInterpreter(GObject.Object):
             "timedelta": timedelta,
             "settings": self._SettingsProxy(self.settings),
             "game": self.modules,
+            "_print": self._print,
+            "_Stopwatch": _Stopwatch,
         }
+        env.update(self._SAFE_EVAL_NAMES)
+        if local_store:
+            env.update(local_store)
         try:
             return eval(compile(py, "<asl-expr>", "eval"), {"__builtins__": {}}, env)
-        except Exception as e:
+        except TypeError:
+            if _allow_concat:
+                concat = self._try_string_concat(expr, local_store)
+                if concat is not None:
+                    return concat
             return None
+        except Exception:
+            if _allow_concat:
+                concat = self._try_string_concat(expr, local_store)
+                if concat is not None:
+                    return concat
+            return None
+
+    def _split_top_level_plus(self, expr: str) -> list[str]:
+        """Split an expression on top-level '+' operators, ignoring strings/parens."""
+
+        parts: list[str] = []
+        depth = 0
+        buf: list[str] = []
+        in_str = False
+        str_ch = ""
+        i = 0
+        n = len(expr)
+        while i < n:
+            ch = expr[i]
+            if in_str:
+                buf.append(ch)
+                if ch == str_ch and (i == 0 or expr[i - 1] != "\\"):
+                    in_str = False
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_str = True
+                str_ch = ch
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if depth == 0 and ch == "+":
+                parts.append("".join(buf).strip())
+                buf = []
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+        if buf:
+            parts.append("".join(buf).strip())
+        return parts
+
+    def _strip_wrapping_parens(self, expr: str) -> str | None:
+        """Return inner expression if expr is fully enclosed in a single pair of parens."""
+
+        s = expr.strip()
+        if not s or s[0] != "(" or s[-1] != ")":
+            return None
+
+        depth = 0
+        in_str = False
+        str_ch = ""
+        for i, ch in enumerate(s):
+            if in_str:
+                if ch == str_ch and (i == 0 or s[i - 1] != "\\"):
+                    in_str = False
+                continue
+            if ch in ('"', "'"):
+                in_str = True
+                str_ch = ch
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    return None
+        if depth == 0:
+            inner = s[1:-1].strip()
+            return inner
+        return None
+
+    def _try_string_concat(
+        self, expr: str, local_store: dict | None = None
+    ) -> str | None:
+        """Attempt C#-style string concatenation, coercing parts to strings."""
+
+        parts = self._split_top_level_plus(expr)
+        if len(parts) <= 1:
+            inner = self._strip_wrapping_parens(expr)
+            if inner and inner != expr.strip():
+                return self._try_string_concat(inner, local_store)
+            return None
+
+        pieces: list[str] = []
+        for part in parts:
+            if not part:
+                continue
+            try:
+                val = self._eval_value(part, local_store, _allow_concat=False)
+            except Exception:
+                val = None
+            if val is None:
+                val = self._try_string_concat(part, local_store)
+            if val is None:
+                try:
+                    val = ast.literal_eval(part)
+                except Exception:
+                    if local_store and part in local_store:
+                        val = local_store[part]
+            if val is None:
+                val = ""
+            pieces.append(val if isinstance(val, str) else str(val))
+
+        return "".join(pieces) if pieces else ""
+
+    def _split_indexer(
+        self, expr: str, local_store: dict | None = None
+    ) -> tuple[str | None, object | None]:
+        """Split base[index] into (base, evaluated index)."""
+
+        s = expr.strip()
+        if not s.endswith("]"):
+            return s, None
+
+        depth = 0
+        for i in range(len(s) - 1, -1, -1):
+            ch = s[i]
+            if ch == "]":
+                depth += 1
+            elif ch == "[":
+                depth -= 1
+                if depth == 0:
+                    base = s[:i].strip()
+                    index_expr = s[i + 1 : -1].strip()
+                    if not base:
+                        return None, None
+                    index_val = None
+                    if index_expr:
+                        index_val = self._eval_value(index_expr, local_store)
+                        if index_val is None:
+                            try:
+                                index_val = ast.literal_eval(index_expr)
+                            except Exception:
+                                if index_expr.isdigit():
+                                    index_val = int(index_expr)
+                                elif index_expr:
+                                    index_val = index_expr
+                    return base, index_val
+        return s, None
+
+    def _get_index_value(self, container, index):
+        """Return container[index] with safety for list/dict."""
+
+        if container is None:
+            return None
+        try:
+            if isinstance(container, list):
+                idx = int(index)
+                if idx < 0 or idx >= len(container):
+                    return None
+                return container[idx]
+            if isinstance(container, dict):
+                return container.get(index)
+            return container[index]
+        except Exception:
+            return None
+
+    def _assign_index(self, container, index, value):
+        """Assign container[index] = value, growing lists as needed."""
+
+        if container is None:
+            return
+        try:
+            if isinstance(container, list):
+                idx = int(index)
+                if idx < 0:
+                    return
+                while len(container) <= idx:
+                    container.append(None)
+                container[idx] = value
+                return
+            if isinstance(container, dict):
+                container[index] = value
+                return
+            container[index] = value
+        except Exception:
+            return
+
+    def _iter_foreach(self, collection) -> list:
+        if collection is None:
+            return []
+        if isinstance(collection, dict):
+            return [SimpleNamespace(Key=k, Value=v) for k, v in collection.items()]
+        if hasattr(collection, "items") and callable(collection.items):
+            try:
+                return [SimpleNamespace(Key=k, Value=v) for k, v in collection.items()]
+            except Exception:
+                pass
+        try:
+            iterator = iter(collection)
+        except TypeError:
+            return []
+        wrapped: list = []
+        for item in iterator:
+            if isinstance(item, SimpleNamespace) and hasattr(item, "Key"):
+                wrapped.append(item)
+                continue
+            if isinstance(item, tuple) and len(item) == 2:
+                wrapped.append(SimpleNamespace(Key=item[0], Value=item[1]))
+                continue
+            wrapped.append(item)
+        return wrapped
+
+    def _parse_array_literal(self, expr: str, local_store: dict | None = None) -> list:
+        """Parse a C# new[] { ... } literal embedded in a single expression."""
+
+        start = expr.find("{")
+        end = expr.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return []
+        body = expr[start + 1 : end].strip()
+        if not body:
+            return []
+
+        parts: list[str] = []
+        buf: list[str] = []
+        depth = 0
+        in_str = False
+        str_ch = ""
+        i = 0
+        while i < len(body):
+            ch = body[i]
+            if in_str:
+                buf.append(ch)
+                if ch == str_ch and (i == 0 or body[i - 1] != "\\"):
+                    in_str = False
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_str = True
+                str_ch = ch
+                buf.append(ch)
+                i += 1
+                continue
+            if ch in "({[":
+                depth += 1
+            elif ch in ")}]":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                part = "".join(buf).strip()
+                if part:
+                    parts.append(part)
+                buf = []
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+        if buf:
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+
+        values: list = []
+
+        def _strip_comment(segment: str) -> str:
+            in_str_local = False
+            quote_ch = ""
+            i2 = 0
+            while i2 < len(segment):
+                ch2 = segment[i2]
+                if in_str_local:
+                    if ch2 == quote_ch and (i2 == 0 or segment[i2 - 1] != "\\"):
+                        in_str_local = False
+                    i2 += 1
+                    continue
+                if ch2 in ('"', "'"):
+                    in_str_local = True
+                    quote_ch = ch2
+                    i2 += 1
+                    continue
+                if ch2 == "/" and i2 + 1 < len(segment) and segment[i2 + 1] == "/":
+                    return segment[:i2].strip()
+                i2 += 1
+            return segment.strip()
+
+        for part in parts:
+            if not part:
+                continue
+            part = _strip_comment(part)
+            if not part:
+                continue
+            val = self._eval_value(part, local_store)
+            if val is None:
+                lower = part.strip().lower()
+                if lower == "null":
+                    val = None
+                elif lower == "true":
+                    val = True
+                elif lower == "false":
+                    val = False
+                else:
+                    try:
+                        val = ast.literal_eval(part)
+                    except Exception:
+                        val = part.strip('"')
+            values.append(val)
+        return values
+
+    def _parse_array_literal_from_script(
+        self, start_idx: int | None, local_store: dict | None = None
+    ) -> list | None:
+        if start_idx is None:
+            return None
+        i = start_idx
+        n = len(self.asl_script)
+        # Move to first '{'
+        while i < n and "{" not in self.asl_script[i]:
+            i += 1
+        if i >= n:
+            return None
+        i += 1
+        values: list = []
+        while i < n:
+            line = self.asl_script[i].strip()
+            if line.startswith("}"):
+                break
+            if not line or line.startswith("//"):
+                i += 1
+                continue
+            segment = line
+            # Remove inline comments
+            j = 0
+            in_str = False
+            str_ch = ""
+            cut = len(segment)
+            while j < len(segment):
+                ch = segment[j]
+                if in_str:
+                    if ch == str_ch and (j == 0 or segment[j - 1] != "\\"):
+                        in_str = False
+                    j += 1
+                    continue
+                if ch in ('"', "'"):
+                    in_str = True
+                    str_ch = ch
+                    j += 1
+                    continue
+                if ch == "/" and j + 1 < len(segment) and segment[j + 1] == "/":
+                    cut = j
+                    break
+                j += 1
+            segment = segment[:cut].strip().rstrip(",")
+            if segment:
+                val = self._eval_value(segment, local_store)
+                if val is None:
+                    lowered = segment.strip().lower()
+                    if lowered == "null":
+                        val = None
+                    elif lowered == "true":
+                        val = True
+                    elif lowered == "false":
+                        val = False
+                    else:
+                        try:
+                            val = ast.literal_eval(segment)
+                        except Exception:
+                            val = segment.strip('"')
+                values.append(val)
+            i += 1
+        return values
+
+    def _find_statement_index(self, prefix: str) -> int | None:
+        for idx, line in enumerate(self.asl_script):
+            if line.strip().startswith(prefix):
+                return idx
+        return None
+
+    def _evaluate_rhs(
+        self,
+        rhs: str,
+        local_store: dict | None = None,
+        statement_index: int | None = None,
+    ):
+        rhs_strip = rhs.strip()
+        if rhs_strip.startswith("new[]"):
+            arr = self._parse_array_literal_from_script(statement_index, local_store)
+            if arr is not None:
+                return arr
+            return self._parse_array_literal(rhs_strip, local_store)
+        val = self._eval_value(rhs, local_store)
+        if val is None:
+            val = self.identify_type(rhs)
+        return val
+
+    def _print(self, *values):
+        try:
+            msg = " ".join("" if v is None else str(v) for v in values)
+        except Exception:
+            msg = ""
+        try:
+            print(msg)
+        except Exception:
+            pass
+
+    def _collect_statement(self, start_idx: int) -> tuple[str, int]:
+        """Collect lines starting at start_idx until a semicolon at brace depth zero."""
+
+        n = len(self.asl_script)
+        parts: list[str] = []
+        depth = 0
+        i = start_idx
+        while i < n:
+            raw = self.asl_script[i]
+            stripped = raw.strip()
+            if not parts and not stripped:
+                i += 1
+                continue
+            parts.append(stripped)
+            depth += raw.count("{") - raw.count("}")
+            if stripped.endswith(";") and depth <= 0:
+                break
+            i += 1
+        combined = " ".join(p for p in parts if p)
+        return combined, i
 
     def _read_block_or_single(self, start_idx: int) -> tuple[int, list[str]]:
         """Return (next_index, inner_lines) for a block or a single statement.
@@ -1040,23 +1544,120 @@ class ASLInterpreter(GObject.Object):
         # single statement
         return i2 + 1, [lines[i2]]
 
+    def _gather_statement_from_list(
+        self, lines: list[str], start: int
+    ) -> tuple[str, int]:
+        parts: list[str] = []
+        i = start
+        n = len(lines)
+        paren = 0
+        brace = 0
+        in_str = False
+        quote = ""
+        while i < n:
+            raw = lines[i]
+            stripped = raw.strip()
+            if not parts and stripped == "":
+                i += 1
+                continue
+            parts.append(stripped)
+            prev = ""
+            for ch in raw:
+                if in_str:
+                    if ch == quote and prev != "\\":
+                        in_str = False
+                    prev = ch
+                    continue
+                if ch in ('"', "'"):
+                    in_str = True
+                    quote = ch
+                elif ch == "(":
+                    paren += 1
+                elif ch == ")":
+                    if paren > 0:
+                        paren -= 1
+                elif ch == "{":
+                    brace += 1
+                elif ch == "}":
+                    if brace > 0:
+                        brace -= 1
+                prev = ch
+            stripped_no_comment = stripped.split("//", 1)[0].rstrip()
+            if brace == 0 and paren == 0 and stripped_no_comment.endswith(";"):
+                return " ".join(parts), i
+            if stripped_no_comment.endswith("{") and brace > 0 and paren == 0:
+                return " ".join(parts), i
+            if brace == 0 and stripped_no_comment.endswith("}"):
+                return " ".join(parts), i
+            i += 1
+        return (" ".join(parts), max(start, n - 1)) if parts else ("", start)
+
     def _exec_lines(self, lines: list[str], local_store: dict | None):
         """Execute a list of simple statements, supporting nested if/else inside the list."""
+        if not hasattr(self, "_loop_continue"):
+            self._loop_continue = False
         k = 0
         while k < len(lines):
-            s = lines[k].strip()
+            stmt, stmt_end = self._gather_statement_from_list(lines, k)
+            s = stmt.strip()
             if not s:
-                k += 1
+                k = stmt_end + 1
+                continue
+            if s.startswith("foreach"):
+                mfor = re.match(
+                    r"^foreach\s*\(\s*(?:var\s+)?([A-Za-z_][A-Za-z0-9_]*)\s+in\s*(.*)\)\s*(?:\{)?\s*(?://.*)?$",
+                    s,
+                )
+                if not mfor:
+                    k = stmt_end + 1
+                    continue
+                var_name = mfor.group(1)
+                iter_expr = mfor.group(2).strip()
+                k_body_end, body_lines = self._consume_block_from_list(
+                    lines, stmt_end + 1
+                )
+                iterable = self._eval_value(iter_expr, local_store)
+                sequence = self._iter_foreach(iterable)
+                prev_flag = self._loop_continue
+                had_prev = False
+                prev_val = None
+                if isinstance(local_store, dict) and var_name in local_store:
+                    had_prev = True
+                    prev_val = local_store[var_name]
+                for item in sequence:
+                    self._loop_continue = False
+                    if isinstance(local_store, dict):
+                        local_store[var_name] = item
+                        self._exec_lines(body_lines, local_store)
+                    else:
+                        temp_store = {var_name: item}
+                        self._exec_lines(body_lines, temp_store)
+                    if getattr(self, "_action_return_set", False):
+                        break
+                    if getattr(self, "_loop_continue", False):
+                        self._loop_continue = False
+                        continue
+                if isinstance(local_store, dict):
+                    if had_prev:
+                        local_store[var_name] = prev_val
+                    else:
+                        local_store.pop(var_name, None)
+                self._loop_continue = prev_flag
+                k = k_body_end
+                if getattr(self, "_action_return_set", False):
+                    return
                 continue
             if s.startswith("if"):
                 mloc = re.match(r"^if\s*\((.*)\)\s*$", s) or re.match(
                     r"^if\s*\((.*)\)\s*\{?\s*$", s
                 )
                 if not mloc:
-                    k += 1
+                    k = stmt_end + 1
                     continue
                 cond_loc = mloc.group(1).strip()
-                k_then_end, then_lines_loc = self._consume_block_from_list(lines, k + 1)
+                k_then_end, then_lines_loc = self._consume_block_from_list(
+                    lines, stmt_end + 1
+                )
                 # Collect zero or more else-if branches and optional final else
                 j2 = k_then_end
                 while j2 < len(lines) and lines[j2].strip() == "":
@@ -1081,12 +1682,13 @@ class ASLInterpreter(GObject.Object):
 
                 # Decide branch across then/elif*/else
                 chosen: list[str] = []
-                if self._eval_condition(cond_loc):
+                cond_result = self._eval_condition(cond_loc, local_store)
+                if cond_result:
                     chosen = then_lines_loc
                 else:
                     matched = False
                     for cexpr, body in elif_branches:
-                        if self._eval_condition(cexpr):
+                        if self._eval_condition(cexpr, local_store):
                             chosen = body
                             matched = True
                             break
@@ -1094,6 +1696,9 @@ class ASLInterpreter(GObject.Object):
                         chosen = else_lines_loc
 
                 self._exec_lines(chosen, local_store)
+                if cond_result and "continue;" in s:
+                    self._loop_continue = True
+                    return
                 k = j2
                 if getattr(self, "_action_return_set", False):
                     return
@@ -1116,14 +1721,15 @@ class ASLInterpreter(GObject.Object):
                 # return <expr>
                 mret = re.match(r"^return\s+(.*)$", tok)
                 if mret:
-                    val = self._eval_value(mret.group(1).strip())
+                    val = self._eval_value(mret.group(1).strip(), local_store)
                     self._action_return_set = True
                     self._action_return = val
                     return
-            result = self._process_simple_statement_line(s, local_store)
+            result = self._process_simple_statement_line(s, local_store, k)
             if result:
                 local_store.update(result)
-            k += 1
+            k = stmt_end + 1
+            continue
 
     def _process_if_block_in_stream(self, local_store: dict | None) -> dict:
         """Process an if (...) [then] [else] at self.i; advances self.i past it."""
@@ -1160,12 +1766,12 @@ class ASLInterpreter(GObject.Object):
 
         # Decide which branch to execute
         target: list[str] = []
-        if self._eval_condition(cond):
+        if self._eval_condition(cond, local_store):
             target = then_lines
         else:
             matched = False
             for cexpr, body in elif_branches:
-                if self._eval_condition(cexpr):
+                if self._eval_condition(cexpr, local_store):
                     target = body
                     matched = True
                     break
@@ -1185,7 +1791,10 @@ class ASLInterpreter(GObject.Object):
         return local_store
 
     def _process_simple_statement_line(
-        self, s: str, local_store: dict | None = None
+        self,
+        s: str,
+        local_store: dict | None = None,
+        statement_index: int | None = None,
     ) -> dict:
         """Handle very simple one-line statements used in ASL blocks:
         - assignments to vars.* and current.*
@@ -1193,50 +1802,194 @@ class ASLInterpreter(GObject.Object):
         - calls to vars.resetVars()
         Ignores anything else.
         """
+        type_map = {
+            "sbyte": "int",
+            "byte": "int",
+            "short": "int",
+            "ushort": "int",
+            "int": "int",
+            "uint": "int",
+            "long": "int",
+            "ulong": "int",
+            "float": "float",
+            "double": "float",
+            "bool": "bool",
+            "string": "str",
+        }
         if not s:
             return
+        stripped_stmt = s.strip()
+        m_print_stmt = re.match(r"^print\s*\((.*)\)\s*;\s*$", stripped_stmt)
+        if m_print_stmt:
+            expr = f"print({m_print_stmt.group(1)})"
+            try:
+                self._eval_value(expr, local_store)
+            except Exception:
+                pass
+            return None
+
+        def _combine_augmented(base, addend):
+            if isinstance(base, str) or isinstance(addend, str):
+                b = "" if base is None else str(base)
+                a = "" if addend is None else str(addend)
+                return b + a
+            if base is None:
+                return addend
+            if addend is None:
+                return base
+            try:
+                return base + addend
+            except Exception:
+                b = "" if base is None else str(base)
+                a = "" if addend is None else str(addend)
+                return b + a
+
         # Local var declarations
         if s.startswith("var ") and "=" in s and s.endswith(";"):
             name = s.split("=", 1)[0].strip().split(" ", 1)[1].strip()
             rhs = s.split("=", 1)[1].strip().strip(";")
-            val = self.identify_type(rhs)
+            val = self._eval_value(rhs, local_store)
+            if val is None:
+                val = self.identify_type(rhs)
             if local_store is not None:
                 local_store[name] = val
                 return local_store
             return None
         # Assignments to vars.* or current.* or timer.*
-        if "=" in s and s.endswith(";"):
-            lhs, rhs = s.split("=", 1)
+        if s.endswith(";"):
+            stmt = s.rstrip().rstrip(";")
+            if "+=" in stmt:
+                lhs, rhs = stmt.split("+=", 1)
+                lhs = lhs.strip()
+                rhs = rhs.strip()
+                rhs_val = self._eval_value(rhs, local_store)
+                if rhs_val is None:
+                    rhs_val = self.identify_type(rhs)
+
+                if lhs.startswith("vars."):
+                    target_expr = lhs.replace("vars.", "", 1)
+                    if target_expr.endswith("]"):
+                        base, index = self._split_indexer(target_expr, local_store)
+                        if base and index is not None:
+                            container = self.vars.get(base)
+                            if container is None:
+                                container = [] if isinstance(index, int) else {}
+                                self.vars[base] = container
+                            current_val = self._get_index_value(container, index)
+                            self._assign_index(
+                                container,
+                                index,
+                                _combine_augmented(current_val, rhs_val),
+                            )
+                            return
+                    key = target_expr
+                    current_val = self.vars.get(key)
+                    self.vars[key] = _combine_augmented(current_val, rhs_val)
+                    return
+                if lhs.startswith("current."):
+                    target_expr = lhs.replace("current.", "", 1)
+                    if target_expr.endswith("]"):
+                        base, index = self._split_indexer(target_expr, local_store)
+                        if base and index is not None:
+                            container = self.current.get(base)
+                            if container is None:
+                                container = [] if isinstance(index, int) else {}
+                                self.current[base] = container
+                            current_val = self._get_index_value(container, index)
+                            new_val = _combine_augmented(current_val, rhs_val)
+                            self._assign_index(container, index, new_val)
+                            return None
+                    key = target_expr
+                    current_val = self.current.get(key)
+                    new_val = _combine_augmented(current_val, rhs_val)
+                    if key in self.current and self.current.get(key) != new_val:
+                        self.old[key] = self.current.get(key)
+                    self.current[key] = new_val
+                    return None
+                if lhs.startswith("timer."):
+                    attr = lhs.split(".", 1)[1]
+                    current_val = getattr(self.timer, attr, None)
+                    try:
+                        setattr(
+                            self.timer,
+                            attr,
+                            _combine_augmented(current_val, rhs_val),
+                        )
+                    except Exception:
+                        pass
+                    return None
+                if local_store is not None:
+                    if lhs.endswith("]"):
+                        base, index = self._split_indexer(lhs, local_store)
+                        if base and index is not None:
+                            container = local_store.get(base)
+                            if container is None:
+                                container = [] if isinstance(index, int) else {}
+                                local_store[base] = container
+                            current_val = self._get_index_value(container, index)
+                            self._assign_index(
+                                container,
+                                index,
+                                _combine_augmented(current_val, rhs_val),
+                            )
+                            return local_store
+                    if lhs in local_store:
+                        current_val = local_store.get(lhs)
+                        local_store[lhs] = _combine_augmented(current_val, rhs_val)
+                        return local_store
+
+            if "=" not in stmt:
+                return
+            lhs, rhs = stmt.split("=", 1)
             lhs = lhs.strip()
-            rhs = rhs.strip().strip(";")
+            rhs = rhs.strip()
             if lhs.startswith("vars."):
-                lhs = lhs.replace("vars.", "", 1)
+                target_expr = lhs.replace("vars.", "", 1)
                 # Evaluate dynamic expressions (supports casts); fallback to identify_type
-                val = self._eval_value(rhs)
-                if val is None:
-                    val = self.identify_type(rhs)
-                self.vars[lhs] = val
+                val = self._evaluate_rhs(rhs, local_store, statement_index)
+                if target_expr.endswith("]"):
+                    base, index = self._split_indexer(target_expr, local_store)
+                    if base and index is not None:
+                        container = self.vars.get(base)
+                        if container is None:
+                            container = [] if isinstance(index, int) else {}
+                            self.vars[base] = container
+                        self._assign_index(container, index, val)
+                        return
+                self.vars[target_expr] = val
                 return
             if lhs.startswith("current."):
-                key = lhs.replace("current.", "", 1)
-                new_val = self._eval_value(rhs)
-                if new_val is None:
-                    new_val = self.identify_type(rhs)
+                target_expr = lhs.replace("current.", "", 1)
+                new_val = self._evaluate_rhs(rhs, local_store, statement_index)
+                if target_expr.endswith("]"):
+                    base, index = self._split_indexer(target_expr, local_store)
+                    if base and index is not None:
+                        container = self.current.get(base)
+                        if container is None:
+                            container = [] if isinstance(index, int) else {}
+                            self.current[base] = container
+                        old_val = self._get_index_value(container, index)
+                        self._assign_index(container, index, new_val)
+                        return None
+                key = target_expr
                 if key in self.current and self.current.get(key) != new_val:
                     self.old[key] = self.current.get(key)
                 self.current[key] = new_val
                 return None
             if lhs.startswith("timer."):
                 attr = lhs.split(".", 1)[1]
-                val = self._eval_value(rhs)
+                val = self._evaluate_rhs(rhs, local_store, statement_index)
                 try:
                     setattr(self.timer, attr, val)
                 except Exception:
                     pass
                 return None
-            else:
+
+            elif lhs.split(" ", 1)[0] in type_map.keys():
                 var_type, var_name = lhs.split(" ", 1)
-                local_store[var_name] = self.identify_type(rhs)
+                val = self._evaluate_rhs(rhs, local_store, statement_index)
+                local_store[var_name] = val
+                return local_store
         # Reset call
         if "vars.resetVars()" in s:
             self.reset_vars()
@@ -1261,7 +2014,7 @@ class ASLInterpreter(GObject.Object):
                     s = self.asl_script[self.i].strip()
                     if s.startswith("}"):
                         break
-                    local_store = self._process_simple_statement_line(s, None)
+                    local_store = self._process_simple_statement_line(s, None, self.i)
                     if local_store:
                         exit_vars.update(local_store)
                     self.i += 1
@@ -1369,33 +2122,57 @@ class ASLInterpreter(GObject.Object):
     def startup(self):
         self.vars = {}
         self.i = 0
-        init_line = 0
         n = len(self.asl_script)
-        current_parent = ""
+        # Capture top-level vars assignments before startup block
         while self.i < n:
-            if self.asl_script[self.i].strip().startswith("init"):
-                init_line = self.i
-                self.i += 1
+            line = self.asl_script[self.i].strip()
+            if line.startswith("startup"):
                 break
-            if (
-                self.asl_script[self.i].strip().startswith("vars.")
-                and "=" in self.asl_script[self.i]
-            ):
-                var_name = (
-                    self.asl_script[self.i]
-                    .strip()
-                    .strip(";")
-                    .split("=")[0]
-                    .strip()
-                    .replace("vars.", "")
-                )
-                var_value = self.identify_type(
-                    self.asl_script[self.i].strip().strip(";").split("=")[1]
-                )
-                self.vars[var_name] = var_value
+            if line.startswith("vars.") and ("=" in line or "+=" in line):
+                stmt, end_idx = self._collect_statement(self.i)
+                if stmt:
+                    self._process_simple_statement_line(stmt, None, self.i)
+                self.i = max(self.i, end_idx) + 1
+                continue
             self.i += 1
+
+        # Parse startup block statements
+        while self.i < n and not self.asl_script[self.i].strip().startswith("startup"):
+            self.i += 1
+        if self.i < n and self.asl_script[self.i].strip().startswith("startup"):
+            # move to first '{'
+            self.i += 1
+            while self.i < n and "{" not in self.asl_script[self.i]:
+                self.i += 1
+            if self.i < n:
+                self.i += 1
+                while self.i < n:
+                    raw = self.asl_script[self.i].strip()
+                    if raw.startswith("}"):
+                        break
+                    if not raw or raw.startswith("//"):
+                        self.i += 1
+                        continue
+                    stmt, end_idx = self._collect_statement(self.i)
+                    if stmt:
+                        self._process_simple_statement_line(stmt, None, self.i)
+                    self.i = max(self.i, end_idx) + 1
+
         # Fallback/global parsing to ensure settings exist before tooltips
         self._parse_settings_and_tooltips_global()
+
+        if "ACContinueRooms" not in self.vars:
+            idx = self._find_statement_index("vars.ACContinueRooms")
+            arr = self._parse_array_literal_from_script(idx, None)
+            if arr is not None:
+                self.vars["ACContinueRooms"] = arr
+        if "OSTRooms" not in self.vars:
+            idx = self._find_statement_index("vars.OSTRooms")
+            arr = self._parse_array_literal_from_script(idx, None)
+            if arr is not None:
+                self.vars["OSTRooms"] = arr
+        if "firstUpdateDone" not in self.vars:
+            self.vars["firstUpdateDone"] = False
 
     # endregion
 
@@ -1475,9 +2252,16 @@ class ASLInterpreter(GObject.Object):
 
         if "new " in value:
             if value.startswith("new Dictionary"):
+                m_arr = re.match(r"^new\s+Dictionary[^{\[]*\[(\d+)\]\s*$", value)
+                if m_arr:
+                    try:
+                        size = int(m_arr.group(1))
+                    except ValueError:
+                        size = 0
+                    return [None] * size
                 return self._parse_dictionary_of_funcs()
             if value.startswith("new HashSet"):
-                return set()
+                return _HashSet()
             # Map new FileInfo(x).DirectoryName and similar property chains via _eval_expr
             if value.startswith("new FileInfo"):
                 # Try to evaluate full expression (possibly with + "..." appended)

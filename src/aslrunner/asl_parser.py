@@ -102,17 +102,6 @@ class _Stopwatch:
         return int(total * 1000)
 
 
-class _HashSet(set):
-    def Add(self, item):
-        self.add(item)
-
-    def Contains(self, item):
-        return item in self
-
-    def Clear(self):
-        self.clear()
-
-
 class ASLModule(GObject.Object):
     __gtype__name__ = "ASLModule"
 
@@ -458,13 +447,19 @@ class ASLInterpreter(GObject.Object):
                 if not cur_alive or not same_in_found:
                     if found:
                         self.modules = ASLModule(state.process_name)
+                        self.initialized = False
                     else:
                         # No matching process currently; clear modules
                         self.modules = ASLModule()
+                        self.initialized = False
             else:
                 # No modules yet; attach if a matching process exists
                 if found:
                     self.modules = ASLModule(state.process_name)
+                    self.initialized = False
+            if self.version == "Unknown":
+                self.initialized = False
+                break
             if state.version == self.version:
                 for var_name, meta in state.variables.items():
                     try:
@@ -475,7 +470,7 @@ class ASLInterpreter(GObject.Object):
                             meta.get("base_module", "") or "",
                             meta.get("type", "string256"),
                         )
-                        if val != self.old.get(var_name) and var_name in self.current:
+                        if var_name in self.current:
                             self.old[var_name] = self.current[var_name]
                         self.current[var_name] = val
                     except Exception as e:
@@ -537,6 +532,8 @@ class ASLInterpreter(GObject.Object):
             self.initialize()
 
         # Returning True keeps the GLib timeout running
+        for key, value in self.current.items():
+            self.old[key] = value
         return True
 
     def initialize(self):
@@ -1544,64 +1541,13 @@ class ASLInterpreter(GObject.Object):
         # single statement
         return i2 + 1, [lines[i2]]
 
-    def _gather_statement_from_list(
-        self, lines: list[str], start: int
-    ) -> tuple[str, int]:
-        parts: list[str] = []
-        i = start
-        n = len(lines)
-        paren = 0
-        brace = 0
-        in_str = False
-        quote = ""
-        while i < n:
-            raw = lines[i]
-            stripped = raw.strip()
-            if not parts and stripped == "":
-                i += 1
-                continue
-            parts.append(stripped)
-            prev = ""
-            for ch in raw:
-                if in_str:
-                    if ch == quote and prev != "\\":
-                        in_str = False
-                    prev = ch
-                    continue
-                if ch in ('"', "'"):
-                    in_str = True
-                    quote = ch
-                elif ch == "(":
-                    paren += 1
-                elif ch == ")":
-                    if paren > 0:
-                        paren -= 1
-                elif ch == "{":
-                    brace += 1
-                elif ch == "}":
-                    if brace > 0:
-                        brace -= 1
-                prev = ch
-            stripped_no_comment = stripped.split("//", 1)[0].rstrip()
-            if brace == 0 and paren == 0 and stripped_no_comment.endswith(";"):
-                return " ".join(parts), i
-            if stripped_no_comment.endswith("{") and brace > 0 and paren == 0:
-                return " ".join(parts), i
-            if brace == 0 and stripped_no_comment.endswith("}"):
-                return " ".join(parts), i
-            i += 1
-        return (" ".join(parts), max(start, n - 1)) if parts else ("", start)
-
     def _exec_lines(self, lines: list[str], local_store: dict | None):
         """Execute a list of simple statements, supporting nested if/else inside the list."""
-        if not hasattr(self, "_loop_continue"):
-            self._loop_continue = False
         k = 0
         while k < len(lines):
-            stmt, stmt_end = self._gather_statement_from_list(lines, k)
-            s = stmt.strip()
+            s = lines[k].strip()
             if not s:
-                k = stmt_end + 1
+                k += 1
                 continue
             if s.startswith("foreach"):
                 mfor = re.match(
@@ -1609,23 +1555,19 @@ class ASLInterpreter(GObject.Object):
                     s,
                 )
                 if not mfor:
-                    k = stmt_end + 1
+                    k += 1
                     continue
                 var_name = mfor.group(1)
                 iter_expr = mfor.group(2).strip()
-                k_body_end, body_lines = self._consume_block_from_list(
-                    lines, stmt_end + 1
-                )
+                k_body_end, body_lines = self._consume_block_from_list(lines, k + 1)
                 iterable = self._eval_value(iter_expr, local_store)
                 sequence = self._iter_foreach(iterable)
-                prev_flag = self._loop_continue
                 had_prev = False
                 prev_val = None
                 if isinstance(local_store, dict) and var_name in local_store:
                     had_prev = True
                     prev_val = local_store[var_name]
                 for item in sequence:
-                    self._loop_continue = False
                     if isinstance(local_store, dict):
                         local_store[var_name] = item
                         self._exec_lines(body_lines, local_store)
@@ -1634,15 +1576,11 @@ class ASLInterpreter(GObject.Object):
                         self._exec_lines(body_lines, temp_store)
                     if getattr(self, "_action_return_set", False):
                         break
-                    if getattr(self, "_loop_continue", False):
-                        self._loop_continue = False
-                        continue
                 if isinstance(local_store, dict):
                     if had_prev:
                         local_store[var_name] = prev_val
                     else:
                         local_store.pop(var_name, None)
-                self._loop_continue = prev_flag
                 k = k_body_end
                 if getattr(self, "_action_return_set", False):
                     return
@@ -1652,12 +1590,10 @@ class ASLInterpreter(GObject.Object):
                     r"^if\s*\((.*)\)\s*\{?\s*$", s
                 )
                 if not mloc:
-                    k = stmt_end + 1
+                    k += 1
                     continue
                 cond_loc = mloc.group(1).strip()
-                k_then_end, then_lines_loc = self._consume_block_from_list(
-                    lines, stmt_end + 1
-                )
+                k_then_end, then_lines_loc = self._consume_block_from_list(lines, k + 1)
                 # Collect zero or more else-if branches and optional final else
                 j2 = k_then_end
                 while j2 < len(lines) and lines[j2].strip() == "":
@@ -1682,8 +1618,7 @@ class ASLInterpreter(GObject.Object):
 
                 # Decide branch across then/elif*/else
                 chosen: list[str] = []
-                cond_result = self._eval_condition(cond_loc, local_store)
-                if cond_result:
+                if self._eval_condition(cond_loc, local_store):
                     chosen = then_lines_loc
                 else:
                     matched = False
@@ -1696,9 +1631,6 @@ class ASLInterpreter(GObject.Object):
                         chosen = else_lines_loc
 
                 self._exec_lines(chosen, local_store)
-                if cond_result and "continue;" in s:
-                    self._loop_continue = True
-                    return
                 k = j2
                 if getattr(self, "_action_return_set", False):
                     return
@@ -1725,11 +1657,10 @@ class ASLInterpreter(GObject.Object):
                     self._action_return_set = True
                     self._action_return = val
                     return
-            result = self._process_simple_statement_line(s, local_store, k)
+            result = self._process_simple_statement_line(s, local_store)
             if result:
                 local_store.update(result)
-            k = stmt_end + 1
-            continue
+            k += 1
 
     def _process_if_block_in_stream(self, local_store: dict | None) -> dict:
         """Process an if (...) [then] [else] at self.i; advances self.i past it."""
@@ -2261,7 +2192,7 @@ class ASLInterpreter(GObject.Object):
                     return [None] * size
                 return self._parse_dictionary_of_funcs()
             if value.startswith("new HashSet"):
-                return _HashSet()
+                return set()
             # Map new FileInfo(x).DirectoryName and similar property chains via _eval_expr
             if value.startswith("new FileInfo"):
                 # Try to evaluate full expression (possibly with + "..." appended)

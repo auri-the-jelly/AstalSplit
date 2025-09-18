@@ -453,8 +453,7 @@ class DeltarunePlugin:
     # -------- per-tick update --------
     def update(self, interpreter):
         # Ensure we have a pid and signatures once process is available
-        if not self.pid:
-            self._refresh_pid()
+        self._refresh_pid()
         if not self.pid:
             return None
         if not self._scanned:

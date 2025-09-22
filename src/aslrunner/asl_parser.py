@@ -7,17 +7,30 @@ from datetime import datetime, timedelta
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
+import importlib.resources
 from types import SimpleNamespace
 from gi.repository import GObject, GLib, Gio, Gtk
-from proc_utils import (
-    find_variable_value,
-    find_wine_process,
-    get_all_modules,
-    is_64_bit,
-    get_module_base,
-    get_module_memory,
-)
-from game_plugins import load_plugin
+
+try:
+    from aslrunner.proc_utils import (
+        find_variable_value,
+        find_wine_process,
+        get_all_modules,
+        is_64_bit,
+        get_module_base,
+        get_module_memory,
+    )
+    from aslrunner.game_plugins import load_plugin
+except ModuleNotFoundError:
+    from proc_utils import (
+        find_variable_value,
+        find_wine_process,
+        get_all_modules,
+        is_64_bit,
+        get_module_base,
+        get_module_memory,
+    )
+    from game_plugins import load_plugin
 
 # endregion
 
@@ -174,6 +187,9 @@ class ASLSettings:
     def __init__(self):
         super().__init__()
         self.settings = {}
+        self.start = True
+        self.reset = True
+        self.split = True
 
     def add(self, setting_name, setting_value, display_name, parent=""):
         self.settings[setting_name] = {
@@ -241,8 +257,26 @@ class ASLInterpreter(GObject.Object):
         "len": len,
     }
 
-    def __init__(self, asl_script: str):
+    _FLOW_CONTINUE = object()
+    _FLOW_BREAK = object()
+
+    split_signal = GObject.Signal("split_signal")
+    reset_signal = GObject.Signal("reset_signal")
+    start_signal = GObject.Signal("start_signal")
+    pause_signal = GObject.Signal("pause_signal")
+
+    def __init__(
+        self, game_name: str = "", asl_script: str = "", asl_settings: dict = {}
+    ):
         super().__init__()
+        if asl_script is None or not os.path.exists(asl_script):
+            if game_name:
+                asl_script = str(
+                    importlib.resources.files("asl_scripts").joinpath(
+                        f"{game_name}.asl"
+                    )
+                )
+
         self.asl_path = asl_script
         self.asl_script = open(asl_script, "r", encoding="utf-8").read().splitlines()
         # region State Declarations
@@ -266,7 +300,6 @@ class ASLInterpreter(GObject.Object):
         # Expose a dummy timer for ASL access
         self.timer = DummyTimer()
         self._has_started = False
-        GLib.timeout_add(50.0 / 3.0, self.state_update)
         # endregion
         # region Initialization
         self.modules = ASLModule()
@@ -285,6 +318,13 @@ class ASLInterpreter(GObject.Object):
                     self.plugin.setup()
                 except Exception:
                     self.plugin = None
+        if asl_settings:
+            for key, val in asl_settings.items():
+                if key in self.settings.settings:
+                    self.settings.settings[key]["value"] = val
+
+    def start_runtime(self):
+        GLib.timeout_add(50 / 3.0, self.state_update)
 
     def _extract_block(self, header: str) -> list[str]:
         """Return inner lines of the first block with the given header token, else []."""
@@ -470,7 +510,7 @@ class ASLInterpreter(GObject.Object):
                             meta.get("base_module", "") or "",
                             meta.get("type", "string256"),
                         )
-                        if var_name in self.current:
+                        if var_name in self.current and self.current[var_name]:
                             self.old[var_name] = self.current[var_name]
                         self.current[var_name] = val
                     except Exception as e:
@@ -495,6 +535,12 @@ class ASLInterpreter(GObject.Object):
                                 continue
                 except Exception:
                     pass
+            self.settings.settings["Ch1"]["value"] = True
+            self.settings.settings["Ch1_School"]["value"] = True
+            self.settings.settings["Ch1_Fields_Exit"]["value"] = True
+            self.settings.settings["Ch1_SusieLancer_Exit"]["value"] = True
+            self.settings.settings["Ch1_PreKing_Exit"]["value"] = True
+            self.settings.settings["Ch1_Ending"]["value"] = True
             should_continue = self.update_func()
             # Clear per-tick skips after running update
             self._skip_update_norms.clear()
@@ -509,6 +555,7 @@ class ASLInterpreter(GObject.Object):
                         self.timer.StartTimeWithOffset = now + self.timer.Run.Offset
                         self.timer.CurrentPhase = TimerPhase.Running
                         self._has_started = True
+                        self.emit("start_signal")
                         # onStart event
                         self.on_start_func()
                 elif self.timer.CurrentPhase == TimerPhase.Running:
@@ -517,6 +564,7 @@ class ASLInterpreter(GObject.Object):
                     # When isLoading is true, set game time paused
                     if isinstance(is_loading, bool):
                         self.timer.IsGameTimePaused = is_loading
+                        self.emit("pause_signal")
                     _gt = self.game_time_func()
                     # reset / split
                     if self.reset_func():
@@ -524,16 +572,20 @@ class ASLInterpreter(GObject.Object):
                         self.timer.CurrentPhase = TimerPhase.NotRunning
                         self.timer.AttemptEnded = datetime.now()
                         self._has_started = False
+                        self.emit("reset_signal")
                         self.on_reset_func()
                     else:
                         if self.split_func():
+                            self.emit("split_signal")
                             self.on_split_func()
         else:
             self.initialize()
 
         # Returning True keeps the GLib timeout running
         for key, value in self.current.items():
-            self.old[key] = value
+            if value:
+                self.old[key] = value
+        print("tick")
         return True
 
     def initialize(self):
@@ -611,6 +663,19 @@ class ASLInterpreter(GObject.Object):
         __setattr__ = dict.__setitem__
         __delattr__ = dict.__delitem__
 
+    def _wrap_callable_arg(self, value):
+        """Convert nested dict/list arguments so dot access works inside lambdas."""
+
+        if isinstance(value, self.DotDict):
+            return value
+        if isinstance(value, dict):
+            return self.DotDict(
+                {k: self._wrap_callable_arg(v) for k, v in value.items()}
+            )
+        if isinstance(value, list):
+            return [self._wrap_callable_arg(v) for v in value]
+        return value
+
     def _translate_expr(self, expr: str) -> str:
         s = expr.strip().rstrip(",")
         # Convert C# verbatim strings @"..." to Python-safe quoted strings
@@ -635,7 +700,16 @@ class ASLInterpreter(GObject.Object):
         s = re.sub(r"\.EndsWith\s*\(", ".endswith(", s)
         s = re.sub(r"\.StartsWith\s*\(", ".startswith(", s)
         # obj.Contains(arg) -> (arg in obj)
-        s = re.sub(r"([A-Za-z0-9_\.]+)\.Contains\s*\(([^()]+)\)", r"(\2 in \1)", s)
+        contains_pattern = re.compile(
+            r"((?:[A-Za-z_][A-Za-z0-9_]*)(?:\s*(?:\.(?:[A-Za-z_][A-Za-z0-9_]*)|\[[^\]]+\]))*)\s*\.Contains\s*\(([^()]+)\)"
+        )
+
+        def _contains_repl(match: re.Match[str]) -> str:
+            lhs = match.group(1).strip()
+            rhs = match.group(2).strip()
+            return f"({rhs} in {lhs})"
+
+        s = contains_pattern.sub(_contains_repl, s)
         # TimeSpan.FromSeconds(x) -> timedelta(seconds=x)
         s = re.sub(r"\bTimeSpan\.FromSeconds\s*\(", "timedelta(seconds=", s)
         # Convert.ToXxx(x) -> python builtins
@@ -984,7 +1058,7 @@ class ASLInterpreter(GObject.Object):
             return bool(
                 eval(compile(py, "<asl-if>", "eval"), {"__builtins__": {}}, env)
             )
-        except Exception:
+        except Exception as e:
             return False
 
     def _eval_value(
@@ -1541,6 +1615,80 @@ class ASLInterpreter(GObject.Object):
         # single statement
         return i2 + 1, [lines[i2]]
 
+    def _collect_iflike_header(
+        self, lines: list[str], idx: int, prefix: str
+    ) -> tuple[str, int]:
+        """Join consecutive lines forming an if/else-if header (handles multiline conditions)."""
+
+        parts: list[str] = []
+        j = idx
+        depth = 0
+        saw_paren = False
+
+        while j < len(lines):
+            raw = lines[j]
+            stripped = raw.strip()
+            if not parts:
+                if not stripped.startswith(prefix):
+                    break
+            parts.append(stripped)
+            code = stripped.split("//", 1)[0]
+            if "(" in code:
+                saw_paren = True
+            depth += code.count("(")
+            depth -= code.count(")")
+            j += 1
+            if saw_paren and depth <= 0:
+                break
+            # plain else without condition should exit after first line
+            if prefix == "else" and not saw_paren:
+                break
+
+        return " ".join(parts), j
+
+    def _split_if_condition(self, header: str) -> tuple[str | None, str]:
+        """Extract condition and inline suffix from an if/else-if header."""
+
+        code = header.split("//", 1)[0].strip()
+        if code.startswith("else if"):
+            code = code[4:].strip()
+        if not code.startswith("if"):
+            return None, ""
+        code = code[2:].lstrip()
+        if not code.startswith("("):
+            return None, ""
+
+        depth = 0
+        cond_chars: list[str] = []
+        i = 0
+        while i < len(code):
+            ch = code[i]
+            if ch == "(":
+                depth += 1
+                if depth == 1:
+                    i += 1
+                    continue
+            if ch == ")":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            if depth >= 1:
+                cond_chars.append(ch)
+            i += 1
+
+        condition = "".join(cond_chars).strip()
+        suffix = code[i:].strip()
+        return condition, suffix
+
+    def _extract_else_inline(self, header: str) -> str:
+        """Return inline body (if any) following an else token."""
+
+        code = header.split("//", 1)[0].strip()
+        if not code.startswith("else"):
+            return ""
+        return code[4:].strip()
+
     def _exec_lines(self, lines: list[str], local_store: dict | None):
         """Execute a list of simple statements, supporting nested if/else inside the list."""
         k = 0
@@ -1549,6 +1697,10 @@ class ASLInterpreter(GObject.Object):
             if not s:
                 k += 1
                 continue
+            if re.match(r"^continue\s*;?(?:\s*//.*)?$", s):
+                return self._FLOW_CONTINUE
+            if re.match(r"^break\s*;?(?:\s*//.*)?$", s):
+                return self._FLOW_BREAK
             if s.startswith("foreach"):
                 mfor = re.match(
                     r"^foreach\s*\(\s*(?:var\s+)?([A-Za-z_][A-Za-z0-9_]*)\s+in\s*(.*)\)\s*(?:\{)?\s*(?://.*)?$",
@@ -1567,14 +1719,21 @@ class ASLInterpreter(GObject.Object):
                 if isinstance(local_store, dict) and var_name in local_store:
                     had_prev = True
                     prev_val = local_store[var_name]
+                broke_loop = False
                 for item in sequence:
                     if isinstance(local_store, dict):
                         local_store[var_name] = item
-                        self._exec_lines(body_lines, local_store)
+                        result = self._exec_lines(body_lines, local_store)
                     else:
                         temp_store = {var_name: item}
-                        self._exec_lines(body_lines, temp_store)
+                        result = self._exec_lines(body_lines, temp_store)
+                    if result is self._FLOW_CONTINUE:
+                        continue
+                    if result is self._FLOW_BREAK:
+                        broke_loop = True
+                        break
                     if getattr(self, "_action_return_set", False):
+                        broke_loop = True
                         break
                 if isinstance(local_store, dict):
                     if had_prev:
@@ -1584,16 +1743,24 @@ class ASLInterpreter(GObject.Object):
                 k = k_body_end
                 if getattr(self, "_action_return_set", False):
                     return
+                if broke_loop:
+                    continue
                 continue
             if s.startswith("if"):
-                mloc = re.match(r"^if\s*\((.*)\)\s*$", s) or re.match(
-                    r"^if\s*\((.*)\)\s*\{?\s*$", s
-                )
-                if not mloc:
-                    k += 1
+                header, header_end = self._collect_iflike_header(lines, k, "if")
+                cond_loc, inline_suffix = self._split_if_condition(header)
+                if cond_loc is None:
+                    k = header_end
                     continue
-                cond_loc = mloc.group(1).strip()
-                k_then_end, then_lines_loc = self._consume_block_from_list(lines, k + 1)
+
+                inline_suffix = inline_suffix.strip()
+                if inline_suffix and not inline_suffix.startswith("{"):
+                    then_lines_loc = [inline_suffix]
+                    k_then_end = header_end
+                else:
+                    k_then_end, then_lines_loc = self._consume_block_from_list(
+                        lines, header_end
+                    )
                 # Collect zero or more else-if branches and optional final else
                 j2 = k_then_end
                 while j2 < len(lines) and lines[j2].strip() == "":
@@ -1602,16 +1769,32 @@ class ASLInterpreter(GObject.Object):
                 else_lines_loc: list[str] | None = None
                 while j2 < len(lines) and lines[j2].strip().startswith("else"):
                     token2 = lines[j2].strip()
-                    m2loc = re.match(
-                        r"^else\s+if\s*\((.*)\)\s*(?:\{)?\s*(?://.*)?$",
-                        token2,
-                    )
-                    j2 += 1
-                    j2, body = self._consume_block_from_list(lines, j2)
-                    if m2loc:
-                        elif_branches.append((m2loc.group(1).strip(), body))
+                    if token2.startswith("else if"):
+                        header2, header2_end = self._collect_iflike_header(
+                            lines, j2, "else if"
+                        )
+                        cond2, suffix2 = self._split_if_condition(header2)
+                        j2 = header2_end
+                        if cond2 is None:
+                            continue
+                        suffix2 = suffix2.strip()
+                        if suffix2 and not suffix2.startswith("{"):
+                            body = [suffix2]
+                        else:
+                            j2, body = self._consume_block_from_list(lines, j2)
+                        elif_branches.append((cond2.strip(), body))
                     else:
-                        else_lines_loc = body
+                        header_else, header_else_end = self._collect_iflike_header(
+                            lines, j2, "else"
+                        )
+                        inline_else = self._extract_else_inline(header_else).strip()
+                        j2 = header_else_end
+                        if inline_else and not inline_else.startswith("{"):
+                            else_lines_loc = [inline_else]
+                        else:
+                            j2, else_lines_loc = self._consume_block_from_list(
+                                lines, j2
+                            )
                         break
                     while j2 < len(lines) and lines[j2].strip() == "":
                         j2 += 1
@@ -1630,7 +1813,9 @@ class ASLInterpreter(GObject.Object):
                     if not matched and else_lines_loc is not None:
                         chosen = else_lines_loc
 
-                self._exec_lines(chosen, local_store)
+                result = self._exec_lines(chosen, local_store)
+                if result is self._FLOW_CONTINUE or result is self._FLOW_BREAK:
+                    return result
                 k = j2
                 if getattr(self, "_action_return_set", False):
                     return
@@ -1665,17 +1850,20 @@ class ASLInterpreter(GObject.Object):
     def _process_if_block_in_stream(self, local_store: dict | None) -> dict:
         """Process an if (...) [then] [else] at self.i; advances self.i past it."""
         n = len(self.asl_script)
-        header = self.asl_script[self.i].strip()
-        m = re.match(r"^if\s*\((.*)\)\s*$", header)
-        if not m:
-            m = re.match(r"^if\s*\((.*)\)\s*\{?\s*$", header)
-        if not m:
-            self.i += 1
+        header, header_end = self._collect_iflike_header(self.asl_script, self.i, "if")
+        cond, inline_suffix = self._split_if_condition(header)
+        if cond is None:
+            self.i = header_end if header_end > self.i else self.i + 1
             return
-        cond = m.group(1).strip()
-        # Move to then body
-        self.i += 1
-        then_end, then_lines = self._read_block_or_single(self.i)
+
+        inline_suffix = inline_suffix.strip()
+        body_idx = header_end
+        self.i = body_idx
+        if inline_suffix and not inline_suffix.startswith("{"):
+            then_lines = [inline_suffix]
+            then_end = body_idx
+        else:
+            then_end, then_lines = self._read_block_or_single(body_idx)
         # Collect zero or more else-if branches and optional final else
         j = then_end
         while j < n and self.asl_script[j].strip() == "":
@@ -1684,13 +1872,30 @@ class ASLInterpreter(GObject.Object):
         else_lines: list[str] | None = None
         while j < n and self.asl_script[j].strip().startswith("else"):
             token = self.asl_script[j].strip()
-            m2 = re.match(r"^else\s+if\s*\((.*)\)\s*(?:\{)?\s*(?://.*)?$", token)
-            j += 1
-            j, body = self._read_block_or_single(j)
-            if m2:
-                elif_branches.append((m2.group(1).strip(), body))
+            if token.startswith("else if"):
+                header2, header2_end = self._collect_iflike_header(
+                    self.asl_script, j, "else if"
+                )
+                cond2, suffix2 = self._split_if_condition(header2)
+                j = header2_end
+                if cond2 is None:
+                    continue
+                suffix2 = suffix2.strip()
+                if suffix2 and not suffix2.startswith("{"):
+                    body = [suffix2]
+                else:
+                    j, body = self._read_block_or_single(j)
+                elif_branches.append((cond2.strip(), body))
             else:
-                else_lines = body
+                header_else, header_else_end = self._collect_iflike_header(
+                    self.asl_script, j, "else"
+                )
+                inline_else = self._extract_else_inline(header_else).strip()
+                j = header_else_end
+                if inline_else and not inline_else.startswith("{"):
+                    else_lines = [inline_else]
+                else:
+                    j, else_lines = self._read_block_or_single(j)
                 break
             while j < n and self.asl_script[j].strip() == "":
                 j += 1
@@ -1833,8 +2038,8 @@ class ASLInterpreter(GObject.Object):
                     key = target_expr
                     current_val = self.current.get(key)
                     new_val = _combine_augmented(current_val, rhs_val)
-                    if key in self.current and self.current.get(key) != new_val:
-                        self.old[key] = self.current.get(key)
+                    # if key in self.current and self.current.get(key):
+                    # self.old[key] = self.current.get(key)
                     self.current[key] = new_val
                     return None
                 if lhs.startswith("timer."):
@@ -1903,8 +2108,8 @@ class ASLInterpreter(GObject.Object):
                         self._assign_index(container, index, new_val)
                         return None
                 key = target_expr
-                if key in self.current and self.current.get(key) != new_val:
-                    self.old[key] = self.current.get(key)
+                # if key in self.current and self.current.get(key):
+                # self.old[key] = self.current.get(key)
                 self.current[key] = new_val
                 return None
             if lhs.startswith("timer."):
@@ -1957,8 +2162,26 @@ class ASLInterpreter(GObject.Object):
         code = compile(py_expr, "<asl-func>", "eval")
 
         def fn(*args):
-            local_env = {name: arg for name, arg in zip(params, args)}
-            return eval(code, {"__builtins__": {}}, local_env)
+            local_env = {
+                name: self._wrap_callable_arg(arg) for name, arg in zip(params, args)
+            }
+            env = {
+                "version": self.version,
+                "current": self.current,
+                "old": self.old,
+                "vars": self.vars,
+                "settings": self._SettingsProxy(self.settings),
+                "timer": self.timer,
+                "TimerPhase": TimerPhase,
+                "TimingMethod": TimingMethod,
+                "timedelta": timedelta,
+                "game": self.modules,
+                "_print": self._print,
+                "_Stopwatch": _Stopwatch,
+            }
+            env.update(self._SAFE_EVAL_NAMES)
+            env.update(local_env)
+            return eval(code, {"__builtins__": {}}, env)
 
         return fn
 
@@ -2545,7 +2768,8 @@ class ASLInterpreter(GObject.Object):
 
 
 if __name__ == "__main__":
-    asl = ASLInterpreter("Deltarune.asl")
+    asl = ASLInterpreter(asl_script="../asl_scripts/DELTARUNE.asl")
+    asl.start_runtime()
     loop = GLib.MainLoop()
     try:
         loop.run()

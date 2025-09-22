@@ -4,6 +4,7 @@ from gi.repository import Astal, GObject, GLib, Gtk, GObject, Gio
 
 from lssparser.LSSParse import LSSObject
 from timer.SplitsBox import SplitItem, SplitsList
+from aslrunner.asl_parser import ASLSettings, ASLSetting, ASLInterpreter
 
 SYNC = GObject.BindingFlags.SYNC_CREATE
 
@@ -21,7 +22,7 @@ splits = [
 class Timer(GObject.Object):
     __gtype_name__ = "Timer"
     time_s = 0.0
-    time_string = GObject.Property(type=str, default="0:00.000")
+    time_string = GObject.Property(type=str, default="00:00.00")
     running = GObject.Property(type=bool, default=False)
     segments = SplitsList(splits=splits)
     split_signal = GObject.Signal("split_signal")
@@ -36,6 +37,7 @@ class Timer(GObject.Object):
         self.on_interval()
         self.splits = splits
         self.cur_splits = []
+        self.asl_object = None
         GLib.timeout_add(25, self.on_interval, GLib.PRIORITY_HIGH)
 
     def on_interval(self, *_args):
@@ -83,6 +85,20 @@ class Timer(GObject.Object):
         self.splits.clear()
         tmp_segments = []
         lss = LSSObject(lss_path)
+        if lss.if_autosplitter:
+            self.asl_object = ASLInterpreter(
+                game_name=lss.game_name, asl_settings=lss.autosplitter_settings
+            )
+            self.asl_object.connect("split_signal", lambda *_: self.on_split())
+            self.asl_object.connect("reset_signal", lambda *_: self.on_reset())
+            self.asl_object.connect(
+                "start_signal", lambda *_: self.on_start_pause(True)
+            )
+            self.asl_object.connect(
+                "pause_signal", lambda *_: self.on_start_pause(False)
+            )
+            GLib.timeout_add(50.0 / 3.0, self.asl_object.state_update)
+
         for segment in lss.segments:
             split_item = SplitItem(
                 segment.name,

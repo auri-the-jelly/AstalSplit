@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from gi.repository import GObject, GLib, Gio
+from aslrunner.asl_parser import ASLSettings, ASLSetting
 
 # endregion
 
@@ -89,6 +90,8 @@ class LSSObject(GObject.Object):
     attempt_history = []
     offset = GObject.Property(type=float, default=0.0)
     segments = []
+    if_autosplitter = GObject.Property(type=bool, default=False)
+    autosplitter_settings = {}
 
     def __init__(self, lss_path: str | None = None):
         super().__init__()
@@ -135,6 +138,14 @@ class LSSObject(GObject.Object):
                 self.segments = self.save_segments(child)
             elif child.tag == "Metadata":
                 self.metadata = LSSMetadata(child)
+            elif child.tag == "AutoSplitterSettings":
+                self.if_autosplitter = True
+                self.autosplitter_settings = {}
+                for setting in child.find("CustomSettings").findall("Setting"):
+                    if setting.attrib.get("type") == "bool":
+                        setting_id = setting.attrib.get("id", "")
+                        value = setting.text if setting.text is not None else ""
+                        self.autosplitter_settings[setting_id] = value.lower() == "true"
 
     def save_segments(self, xml_tree):
         segments = []

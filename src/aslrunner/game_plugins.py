@@ -17,7 +17,7 @@ REGISTRY: dict[str, PluginInfo] = {
     # You can extend this by adding new entries for other games.
     "DELTARUNE": PluginInfo(
         name="Deltarune",
-        module="games.Deltarune.deltarune",
+        module="aslrunner.games.Deltarune.deltarune",
         class_name="DeltarunePlugin",
     ),
 }

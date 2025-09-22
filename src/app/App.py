@@ -62,7 +62,7 @@ class App(Gtk.Application):
                         command_line.print_literal(
                             "usage: astalsplit <command> \ncommands:\n    start: start the timer\n    pause: pause the timer\n    toggle: toggle start/pause\n    split: record a split\n    reset: reset the timer\n"
                         )
-                return
+                return 0
             else:
                 command_line.print_literal(
                     "usage: astalsplit <command> \n commands:\n    start: start the timer\n    pause: pause the timer\n    toggle: toggle start/pause\n    split: record a split\n    reset: reset the timer\n"
@@ -70,7 +70,7 @@ class App(Gtk.Application):
         else:
             if len(argv) > 2:
                 if argv[1] == "load" and os.path.exists(argv[2]):
-                    self.lss_path = os.path.abspath(argv[1])
+                    self.lss_path = os.path.abspath(argv[2])
                 elif argv[1] == "load":
                     print("Couldn't find file. Ignoring.")
             # main instance, initialize stuff here
@@ -98,6 +98,7 @@ class App(Gtk.Application):
 
             click.connect("pressed", on_pressed)
             self.timer_window.add_controller(click)
+            self.timer_window.timer.load_splits(getattr(self, "lss_path", None))
             self.add_window(self.timer_window)
 
             def on_start_pause(start: bool):

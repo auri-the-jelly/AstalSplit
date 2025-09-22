@@ -395,9 +395,15 @@ class DeltarunePlugin:
 
     def initialize(self, interpreter):
         # Parse ASL init block for signature patterns and offsets
+        self._refresh_pid()
         try:
             here = os.path.dirname(__file__)
-            asl_path = os.path.normpath(os.path.join(here, "..", "..", "Deltarune.asl"))
+            if not interpreter:
+                asl_path = os.path.normpath(
+                    os.path.join(here, "..", "..", "..", "asl_scripts", "DELTARUNE.asl")
+                )
+            else:
+                asl_path = interpreter.asl_path
             with open(asl_path, "r", encoding="utf-8") as f:
                 txt = f.read()
         except Exception as e:
@@ -446,7 +452,7 @@ class DeltarunePlugin:
             with open(data_win, "rb") as f:
                 data = f.read()
                 game_hash = hashlib.md5(data).hexdigest().upper()
-        except Exception:
+        except Exception as e:
             game_hash = ""
         return game_hash
 

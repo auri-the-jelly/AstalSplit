@@ -1,8 +1,18 @@
-from gi.repository import Gio, GLib, Gtk, Gdk, GLib
-from timer.TimerWindow import TimerWindow
 import os
+from pathlib import Path
 
-gresource = Gio.Resource.load("resources.gresource")
+from gi.repository import Gio, GLib, Gtk, Gdk
+from timer.TimerWindow import TimerWindow
+
+
+def _get_data_root() -> Path:
+    env_path = os.environ.get("ASTALSPLIT_DATADIR")
+    if env_path:
+        return Path(env_path)
+    return Path(__file__).resolve().parent.parent
+
+
+gresource = Gio.Resource.load(str(_get_data_root() / "resources.gresource"))
 gresource._register()
 
 
@@ -55,6 +65,7 @@ class App(Gtk.Application):
                             self.lss_path = path
                             command_line.print_literal(f"Loaded {self.lss_path}")
                             self.timer_window.timer.load_splits(self.lss_path)
+                            self._update_asl_settings_action()
                             return
                         else:
                             command_line.print_literal("usage: astalsplit load <path>")
@@ -71,7 +82,10 @@ class App(Gtk.Application):
             if len(argv) > 2:
                 if argv[1] == "load" and os.path.exists(argv[2]):
                     self.lss_path = os.path.abspath(argv[2])
-                elif argv[1] == "load":
+                elif argv[1] == "load" and not os.path.exists(
+                    os.path.join(os.getcwd(), argv[2])
+                ):
+                    print(os.path.join(os.getcwd(), argv[2]))
                     print("Couldn't find file. Ignoring.")
             # main instance, initialize stuff here
             self._init_css()
@@ -81,6 +95,7 @@ class App(Gtk.Application):
             menu.append("Start / Pause", "app.startpause")
             menu.append("Split", "app.split")
             menu.append("Reset", "app.reset")
+            menu.append("Autosplitter Settings", "app.aslsettings")
             menu.append("Quit", "app.quit")
             self.pop = Gtk.PopoverMenu()
             self.pop.set_has_arrow(False)
@@ -99,6 +114,7 @@ class App(Gtk.Application):
             click.connect("pressed", on_pressed)
             self.timer_window.add_controller(click)
             self.timer_window.timer.load_splits(getattr(self, "lss_path", None))
+            self._update_asl_settings_action()
             self.add_window(self.timer_window)
 
             def on_start_pause(start: bool):
@@ -130,7 +146,22 @@ class App(Gtk.Application):
         add("startpause", timer_window.timer.on_start_pause)
         add("split", timer_window.timer.on_split, enabled=False)
         add("reset", timer_window.timer.on_reset, enabled=False)
+        add(
+            "aslsettings",
+            lambda: timer_window.show_asl_settings_dialog(),
+            enabled=False,
+        )
         add("quit", self.quit)
+
+    def _update_asl_settings_action(self):
+        if not hasattr(self, "action_aslsettings"):
+            return
+        has_settings = (
+            hasattr(self, "timer_window")
+            and self.timer_window is not None
+            and self.timer_window.has_script_settings()
+        )
+        self.action_aslsettings.set_enabled(has_settings)
 
     def __init__(self) -> None:
         super().__init__(

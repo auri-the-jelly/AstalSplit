@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="UTF-8"?>
+<?xml version='1.0' encoding='utf-8'?>
 <Run version="1.7.0">
   <GameIcon />
   <GameName>DELTARUNE</GameName>
@@ -241,8 +241,8 @@
       <Setting id="Ch1_KRound2_Exit" type="bool">False</Setting>
       <Setting id="Ch1_Throne_Exit" type="bool">False</Setting>
       <Setting id="Ch1_PreKing_Exit" type="bool">True</Setting>
-      <Setting id="Ch1_King_EndBattle" type="bool">False</Setting>
-      <Setting id="Ch1_King_Exit" type="bool">True</Setting>
+      <Setting id="Ch1_King_EndBattle" type="bool">True</Setting>
+      <Setting id="Ch1_King_Exit" type="bool">False</Setting>
       <Setting id="Ch1_Fountain_Enter" type="bool">False</Setting>
       <Setting id="Ch1_Fountain_Exit" type="bool">False</Setting>
       <Setting id="Ch1_Ending" type="bool">True</Setting>

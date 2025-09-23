@@ -1,11 +1,7 @@
-// https://gitlab.gnome.org/GNOME/gtk/-/blob/gtk-4-16/gtk/theme/Default/_colors-public.scss
-$fg-color: #{"@theme_fg_color"};
-$bg-color: #{"@theme_bg_color"};
-
 window.Timer {
     > box {
-        background: $bg-color;
-        color: $fg-color;
+        background: #555555;
+        color: #ffffff;
         font-weight: bold;
         font-size: 56px;
     }
@@ -17,4 +13,10 @@ window.Timer {
         margin: 4px;
         padding: 4px 8px;
     }
+}
+
+#SplitsBox {
+    background: #000000;
+    color: #ffffff;
+    font-size: 18px;
 }

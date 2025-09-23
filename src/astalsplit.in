@@ -1,0 +1,15 @@
+#!@PYTHON@
+import os
+import sys
+from pathlib import Path
+import runpy
+
+pkgdatadir = Path('@PKGDATADIR@')
+
+# Ensure project sources are importable
+sys.path.insert(0, str(pkgdatadir))
+
+# Let the application discover installed assets without disturbing caller CWD
+os.environ.setdefault('ASTALSPLIT_DATADIR', str(pkgdatadir))
+
+runpy.run_path(pkgdatadir / 'main.py', run_name='__main__')

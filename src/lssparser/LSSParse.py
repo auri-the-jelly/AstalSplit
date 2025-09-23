@@ -7,7 +7,6 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from gi.repository import GObject, GLib, Gio
-from aslrunner.asl_parser import ASLSettings, ASLSetting
 
 # endregion
 
@@ -96,9 +95,13 @@ class LSSObject(GObject.Object):
     def __init__(self, lss_path: str | None = None):
         super().__init__()
         if lss_path is None:
-            lss_path = str(Path(__file__).with_name("src/lssparser/example.lss"))
-        tree = ET.parse(lss_path)
-        root = tree.getroot()
+            lss_path = str(Path(__file__).parent.joinpath("example.lss"))
+        self.path = lss_path
+        self._tree = ET.parse(lss_path)
+        self._root = self._tree.getroot()
+        self._autosplitter_element: ET.Element | None = None
+        self._custom_settings_element: ET.Element | None = None
+        root = self._root
         for child in root:
             if child.tag == "GameName":
                 self.game_name = child.text
@@ -141,11 +144,50 @@ class LSSObject(GObject.Object):
             elif child.tag == "AutoSplitterSettings":
                 self.if_autosplitter = True
                 self.autosplitter_settings = {}
-                for setting in child.find("CustomSettings").findall("Setting"):
+                self._autosplitter_element = child
+                custom_settings = child.find("CustomSettings")
+                if custom_settings is None:
+                    custom_settings = ET.SubElement(child, "CustomSettings")
+                self._custom_settings_element = custom_settings
+                for setting in custom_settings.findall("Setting"):
                     if setting.attrib.get("type") == "bool":
                         setting_id = setting.attrib.get("id", "")
                         value = setting.text if setting.text is not None else ""
                         self.autosplitter_settings[setting_id] = value.lower() == "true"
+
+    def set_autosplitter_settings(self, settings: dict[str, bool]):
+        if not settings:
+            return
+        self.if_autosplitter = True
+        if self._autosplitter_element is None:
+            self._autosplitter_element = ET.SubElement(self._root, "AutoSplitterSettings")
+        if self._custom_settings_element is None:
+            self._custom_settings_element = ET.SubElement(
+                self._autosplitter_element, "CustomSettings"
+            )
+
+        existing = {
+            setting.attrib.get("id", ""): setting
+            for setting in self._custom_settings_element.findall("Setting")
+        }
+
+        for key, value in settings.items():
+            node = existing.get(key)
+            if node is None:
+                node = ET.SubElement(
+                    self._custom_settings_element, "Setting", id=key, type="bool"
+                )
+            node.set("type", "bool")
+            node.set("id", key)
+            node.text = "True" if value else "False"
+
+        self.autosplitter_settings = {k: bool(v) for k, v in settings.items()}
+
+    def save(self, path: str | None = None):
+        target = path or self.path
+        if not target:
+            return
+        self._tree.write(target, encoding="utf-8", xml_declaration=True)
 
     def save_segments(self, xml_tree):
         segments = []

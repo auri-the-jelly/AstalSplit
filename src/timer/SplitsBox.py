@@ -10,6 +10,7 @@ class SplitItem(GObject.GObject):
     best = GObject.Property(type=str, default="00:00.00")
     current_time = GObject.Property(type=float, default=float(1e308))
     best_time = GObject.Property(type=float, default=float(1e308))
+    diff = GObject.Property(type=str, default="")
 
     def __init__(
         self,
@@ -18,6 +19,7 @@ class SplitItem(GObject.GObject):
         best="00:0.00",
         current_time=1e308,
         best_time=1e308,
+        diff="",
     ):
         super().__init__(
             name=name,
@@ -25,6 +27,7 @@ class SplitItem(GObject.GObject):
             best=best,
             current_time=current_time,
             best_time=best_time,
+            diff="",
         )
 
 
@@ -48,6 +51,7 @@ class SplitsList(Gio.ListStore):
                     best=s.get("best", "00:00.00"),
                     current_time=s.get("current_time", float("inf")),
                     best_time=s.get("best_time", float("inf")),
+                    diff="",
                 )
             else:
                 item = s
@@ -78,6 +82,7 @@ class SplitsBox(Gtk.ListBox):
         row.set_hexpand(True)
 
         name_lbl = Gtk.Label(xalign=0, halign=Gtk.Align.START)
+        diff_lbl = Gtk.Label(xalign=1, halign=Gtk.Align.END)
         cur_lbl = Gtk.Label(xalign=1, halign=Gtk.Align.END)
         best_lbl = Gtk.Label(xalign=1, halign=Gtk.Align.END)
 
@@ -89,13 +94,20 @@ class SplitsBox(Gtk.ListBox):
         # Optionally reserve some width for stable columns
         # cur_lbl.set_width_chars(8)
         # best_lbl.set_width_chars(8)
+        diff_lbl.set_width_chars(4)
 
         # initial text
-        name_lbl.set_text(item.props.name)
+        name_lbl.set_text(
+            item.props.name if len(item.props.name) < 10 else item.props.name[:10] + "…"
+        )
+        diff_lbl.set_text("")
         cur_lbl.set_text(item.props.current)
         best_lbl.set_text(item.props.best)
 
         # keep labels in sync with model changes
+        item.connect(
+            "notify::diff", lambda obj, pspec: diff_lbl.set_text(obj.props.diff)
+        )
         item.connect(
             "notify::current", lambda obj, pspec: cur_lbl.set_text(obj.props.current)
         )
@@ -106,6 +118,7 @@ class SplitsBox(Gtk.ListBox):
         # layout
         row.append(name_lbl)
         row.append(spacer)
+        row.append(diff_lbl)
         row.append(cur_lbl)
         row.append(best_lbl)
         return row
@@ -117,6 +130,14 @@ class SplitsBox(Gtk.ListBox):
             item = self.splits_list.get_item(i)  # -> SplitItem
             if item.props.current == "00:00.00":
                 item.props.current = split_string
+                if split_time < item.props.best_time:
+                    item.props.diff = "-" + "{:.2f}".format(
+                        item.props.best_time - split_time
+                    )
+                else:
+                    item.props.diff = "+" + "{:.2f}".format(
+                        split_time - item.props.best_time
+                    )
                 if split_time < item.props.best_time:
                     item.props.best_time = split_time
                     item.props.best = split_string

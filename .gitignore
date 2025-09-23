@@ -11,6 +11,7 @@
 # Distribution / packaging
 .Python
 build/
+result/
 develop-eggs/
 dist/
 downloads/

@@ -1,10 +1,11 @@
 import math
 import time
-from gi.repository import Astal, GObject, GLib, Gtk, GObject, Gio
+
+from gi.repository import Astal, GObject, GLib, Gtk, Gio
 
 from lssparser.LSSParse import LSSObject
 from timer.SplitsBox import SplitItem, SplitsList
-from aslrunner.asl_parser import ASLSettings, ASLSetting, ASLInterpreter
+from aslrunner.asl_parser import ASLInterpreter
 
 SYNC = GObject.BindingFlags.SYNC_CREATE
 
@@ -29,6 +30,7 @@ class Timer(GObject.Object):
     reset_signal = GObject.Signal("reset_signal")
     start_signal = GObject.Signal("start_signal")
     pause_signal = GObject.Signal("pause_signal")
+    settings_requested = GObject.Signal("settings_requested", arg_types=(object,))
 
     def __init__(self):
         super().__init__()
@@ -38,6 +40,8 @@ class Timer(GObject.Object):
         self.splits = splits
         self.cur_splits = []
         self.asl_object = None
+        self.lss = None
+        self.lss_path: str | None = None
         GLib.timeout_add(25, self.on_interval, GLib.PRIORITY_HIGH)
 
     def on_interval(self, *_args):
@@ -85,6 +89,11 @@ class Timer(GObject.Object):
         self.splits.clear()
         tmp_segments = []
         lss = LSSObject(lss_path)
+        self.lss = lss
+        self.lss_path = lss.path
+        if self.asl_object:
+            self.asl_object.stop_runtime()
+            self.asl_object = None
         if lss.if_autosplitter:
             self.asl_object = ASLInterpreter(
                 game_name=lss.game_name, asl_settings=lss.autosplitter_settings
@@ -97,7 +106,15 @@ class Timer(GObject.Object):
             self.asl_object.connect(
                 "pause_signal", lambda *_: self.on_start_pause(False)
             )
-            GLib.timeout_add(50.0 / 3.0, self.asl_object.state_update)
+            self.asl_object.start_runtime()
+            script_specific = self.script_setting_keys()
+            if script_specific and self.script_settings_are_all_default():
+                GLib.idle_add(
+                    self._emit_settings_prompt,
+                    priority=GLib.PRIORITY_DEFAULT,
+                )
+        else:
+            self.asl_object = None
 
         for segment in lss.segments:
             split_item = SplitItem(
@@ -120,3 +137,52 @@ class Timer(GObject.Object):
         m, s = divmod(sec, 60.0)
         m = int(m)
         return f"{m:02d}:{s:05.2f}"
+
+    def _emit_settings_prompt(self):
+        if self.asl_object:
+            self.emit("settings_requested", self.asl_object)
+        return GLib.SOURCE_REMOVE
+
+    def script_setting_keys(self) -> set[str]:
+        if not self.asl_object:
+            return set()
+        return {
+            key
+            for key in self.asl_object.settings.settings.keys()
+            if key not in {"start", "split", "reset"}
+        }
+
+    def script_settings_are_all_default(self) -> bool:
+        if not self.asl_object:
+            return True
+        settings = self.asl_object.settings.settings
+        keys = self.script_setting_keys()
+        if not keys:
+            return True
+        for key in keys:
+            meta = settings.get(key)
+            if not meta:
+                continue
+            default_value = meta.get("default")
+            if default_value is None:
+                default_value = meta.get("value")
+            if meta.get("value") != default_value:
+                return False
+        return True
+
+    def persist_asl_settings(self):
+        if not self.asl_object or not self.lss or not self.lss_path:
+            return
+        if not getattr(self.lss, "if_autosplitter", False):
+            return
+        settings_map: dict[str, bool] = {}
+        for key, meta in self.asl_object.settings.settings.items():
+            try:
+                settings_map[key] = bool(meta.get("value", False))
+            except Exception:
+                settings_map[key] = False
+        try:
+            self.lss.set_autosplitter_settings(settings_map)
+            self.lss.save(self.lss_path)
+        except Exception as exc:
+            print(f"Failed to save LSS autosplitter settings: {exc}")

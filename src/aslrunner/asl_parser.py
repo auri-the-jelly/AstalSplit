@@ -3,6 +3,7 @@ import math
 import time
 import re
 import ast
+import threading
 from datetime import datetime, timedelta
 import os
 import xml.etree.ElementTree as ET
@@ -173,13 +174,22 @@ class ASLSetting(GObject.GObject):
     display_name = GObject.Property(type=str)
     setting_value = GObject.Property(type=bool, default=False)
     parent = GObject.Property(type=str, default="")
+    tooltip = GObject.Property(type=str, default="")
 
-    def __init__(self, setting_name, display_name, setting_value=False, parent=""):
+    def __init__(
+        self,
+        setting_name,
+        display_name,
+        setting_value=False,
+        parent="",
+        tooltip="",
+    ):
         super().__init__()
         self.setting_name = setting_name
         self.display_name = display_name
         self.setting_value = setting_value
         self.parent = parent
+        self.tooltip = tooltip
 
 
 class ASLSettings:
@@ -194,6 +204,7 @@ class ASLSettings:
     def add(self, setting_name, setting_value, display_name, parent=""):
         self.settings[setting_name] = {
             "value": setting_value,
+            "default": setting_value,
             "display_name": display_name,
             "parent": parent or None,
         }
@@ -202,7 +213,7 @@ class ASLSettings:
         if setting_name in self.settings:
             self.settings[setting_name]["tooltip"] = tooltip
 
-    def export_list_object(self):
+    def export_list_object(self, *, passthrough: bool = True):
         """Return a Gtk.TreeListModel for hierarchical settings.
 
         Items are ASLSetting GObjects with properties:
@@ -220,6 +231,7 @@ class ASLSettings:
                 display_name=meta.get("display_name", name),
                 setting_value=meta.get("value", False),
                 parent=meta.get("parent", "") or "",
+                tooltip=meta.get("tooltip", ""),
             )
 
         # Root store: settings with no parent
@@ -238,7 +250,7 @@ class ASLSettings:
             return children if children.get_n_items() > 0 else None
 
         # passthrough=True so rows expose our ASLSetting items directly
-        tree = Gtk.TreeListModel.new(root, True, False, create_func)
+        tree = Gtk.TreeListModel.new(root, passthrough, False, create_func)
         return tree
 
 
@@ -264,6 +276,7 @@ class ASLInterpreter(GObject.Object):
     reset_signal = GObject.Signal("reset_signal")
     start_signal = GObject.Signal("start_signal")
     pause_signal = GObject.Signal("pause_signal")
+    initialized_signal = GObject.Signal("initialized")
 
     def __init__(
         self, game_name: str = "", asl_script: str = "", asl_settings: dict = {}
@@ -323,8 +336,47 @@ class ASLInterpreter(GObject.Object):
                 if key in self.settings.settings:
                     self.settings.settings[key]["value"] = val
 
+        self._tick_interval = 1.0 / 60.0
+        self._worker_stop = threading.Event()
+        self._worker_thread = None
+
+    def _emit_signal_async(self, signal_name: str):
+        def _forward():
+            GObject.Object.emit(self, signal_name)
+            return False
+
+        GLib.idle_add(_forward, priority=GLib.PRIORITY_DEFAULT)
+
+    def _run_worker_loop(self):
+        tick = self._tick_interval
+        while not self._worker_stop.is_set():
+            start = time.perf_counter()
+            try:
+                self.state_update()
+            except Exception as exc:
+                print(f"ASLInterpreter state update failed: {exc}")
+            elapsed = time.perf_counter() - start
+            remaining = tick - elapsed
+            if remaining > 0:
+                self._worker_stop.wait(remaining)
+
     def start_runtime(self):
-        GLib.timeout_add(50 / 3.0, self.state_update)
+        if self._worker_thread and self._worker_thread.is_alive():
+            return
+        self._worker_stop.clear()
+        self._worker_thread = threading.Thread(
+            target=self._run_worker_loop,
+            name="ASLInterpreterLoop",
+            daemon=True,
+        )
+        self._worker_thread.start()
+
+    def stop_runtime(self, join: bool = False):
+        self._worker_stop.set()
+        thread = self._worker_thread
+        self._worker_thread = None
+        if join and thread and thread.is_alive():
+            thread.join(timeout=0.5)
 
     def _extract_block(self, header: str) -> list[str]:
         """Return inner lines of the first block with the given header token, else []."""
@@ -517,6 +569,7 @@ class ASLInterpreter(GObject.Object):
                         self.current[var_name] = None
 
         if self.initialized:
+            self.emit("initialized")
             # Run update and honor an explicit 'return false;' in the bloc
             # Allow game plugin to compute additional dynamic values
             if self.plugin:
@@ -535,12 +588,6 @@ class ASLInterpreter(GObject.Object):
                                 continue
                 except Exception:
                     pass
-            self.settings.settings["Ch1"]["value"] = True
-            self.settings.settings["Ch1_School"]["value"] = True
-            self.settings.settings["Ch1_Fields_Exit"]["value"] = True
-            self.settings.settings["Ch1_SusieLancer_Exit"]["value"] = True
-            self.settings.settings["Ch1_PreKing_Exit"]["value"] = True
-            self.settings.settings["Ch1_Ending"]["value"] = True
             should_continue = self.update_func()
             # Clear per-tick skips after running update
             self._skip_update_norms.clear()
@@ -555,7 +602,7 @@ class ASLInterpreter(GObject.Object):
                         self.timer.StartTimeWithOffset = now + self.timer.Run.Offset
                         self.timer.CurrentPhase = TimerPhase.Running
                         self._has_started = True
-                        self.emit("start_signal")
+                        self._emit_signal_async("start_signal")
                         # onStart event
                         self.on_start_func()
                 elif self.timer.CurrentPhase == TimerPhase.Running:
@@ -564,7 +611,8 @@ class ASLInterpreter(GObject.Object):
                     # When isLoading is true, set game time paused
                     if isinstance(is_loading, bool):
                         self.timer.IsGameTimePaused = is_loading
-                        self.emit("pause_signal")
+                        if is_loading:
+                            self._emit_signal_async("pause_signal")
                     _gt = self.game_time_func()
                     # reset / split
                     if self.reset_func():
@@ -572,11 +620,11 @@ class ASLInterpreter(GObject.Object):
                         self.timer.CurrentPhase = TimerPhase.NotRunning
                         self.timer.AttemptEnded = datetime.now()
                         self._has_started = False
-                        self.emit("reset_signal")
+                        self._emit_signal_async("reset_signal")
                         self.on_reset_func()
                     else:
                         if self.split_func():
-                            self.emit("split_signal")
+                            self._emit_signal_async("split_signal")
                             self.on_split_func()
         else:
             self.initialize()
@@ -585,7 +633,6 @@ class ASLInterpreter(GObject.Object):
         for key, value in self.current.items():
             if value:
                 self.old[key] = value
-        print("tick")
         return True
 
     def initialize(self):

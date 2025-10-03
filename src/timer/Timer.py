@@ -96,7 +96,8 @@ class Timer(GObject.Object):
             self.asl_object = None
         if lss.if_autosplitter:
             self.asl_object = ASLInterpreter(
-                game_name=lss.game_name, asl_settings=lss.autosplitter_settings
+                game_name=lss.game_name.upper(),
+                asl_settings=lss.autosplitter_settings,
             )
             self.asl_object.connect("split_signal", lambda *_: self.on_split())
             self.asl_object.connect("reset_signal", lambda *_: self.on_reset())

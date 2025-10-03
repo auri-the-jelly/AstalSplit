@@ -1150,7 +1150,7 @@ class ASLInterpreter(GObject.Object):
                 if concat is not None:
                     return concat
             return None
-        except Exception:
+        except Exception as e:
             if _allow_concat:
                 concat = self._try_string_concat(expr, local_store)
                 if concat is not None:
@@ -1662,6 +1662,22 @@ class ASLInterpreter(GObject.Object):
         # single statement
         return i2 + 1, [lines[i2]]
 
+    def _line_is_trivia(self, line: str) -> bool:
+        """Return True when the line only contains whitespace or a comment."""
+
+        stripped = line.strip()
+        if not stripped:
+            return True
+        if stripped.startswith("//"):
+            return True
+        if stripped.startswith("/*"):
+            return True
+        if stripped.startswith("*") and stripped.endswith("*/"):
+            return True
+        if stripped == "*/":
+            return True
+        return False
+
     def _collect_iflike_header(
         self, lines: list[str], idx: int, prefix: str
     ) -> tuple[str, int]:
@@ -1728,6 +1744,112 @@ class ASLInterpreter(GObject.Object):
         suffix = code[i:].strip()
         return condition, suffix
 
+    def _split_switch_expr(self, header: str) -> tuple[str | None, str]:
+        """Extract the selector expression and inline suffix from a switch header."""
+
+        code = header.split("//", 1)[0].strip()
+        if not code.startswith("switch"):
+            return None, ""
+        code = code[6:].lstrip()
+        if not code.startswith("("):
+            return None, ""
+
+        depth = 0
+        expr_chars: list[str] = []
+        i = 0
+        while i < len(code):
+            ch = code[i]
+            if ch == "(":
+                depth += 1
+                if depth == 1:
+                    i += 1
+                    continue
+            if ch == ")":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            if depth >= 1:
+                expr_chars.append(ch)
+            i += 1
+
+        if depth != 0:
+            return None, ""
+
+        expr = "".join(expr_chars).strip()
+        suffix = code[i:].strip()
+        return (expr if expr else None), suffix
+
+    def _parse_switch_cases(
+        self, body_lines: list[str]
+    ) -> tuple[list[tuple[list[str], list[str]]], list[str] | None]:
+        """Parse switch case bodies into (cases, default)."""
+
+        case_groups: list[tuple[list[str], list[str]]] = []
+        default_body: list[str] | None = None
+        current_labels: list[str] = []
+        current_body: list[str] = []
+        current_is_default = False
+        current_has_code = False
+
+        def _flush_current():
+            nonlocal current_labels, current_body, current_is_default
+            nonlocal current_has_code, default_body, case_groups
+            if current_is_default:
+                default_body = current_body.copy()
+            elif current_labels and current_has_code:
+                case_groups.append((current_labels.copy(), current_body.copy()))
+            current_labels = []
+            current_body = []
+            current_is_default = False
+            current_has_code = False
+
+        for raw in body_lines:
+            stripped = raw.strip()
+            code = raw.split("//", 1)[0].strip()
+            if not code:
+                if stripped:
+                    current_body.append(raw)
+                continue
+
+            m_case = re.match(r"^case\s+(.*?):\s*(.*)$", code)
+            if m_case:
+                label_expr = m_case.group(1).strip()
+                remainder = m_case.group(2).strip()
+                if current_labels and not current_is_default and not current_has_code:
+                    current_labels.append(label_expr)
+                else:
+                    _flush_current()
+                    current_labels = [label_expr]
+                if remainder:
+                    current_body.append(remainder)
+                    current_has_code = True
+                continue
+
+            m_default = re.match(r"^default\s*:\s*(.*)$", code)
+            if m_default:
+                remainder = m_default.group(1).strip()
+                _flush_current()
+                current_is_default = True
+                if remainder:
+                    current_body.append(remainder)
+                    current_has_code = True
+                continue
+
+            if code.startswith("break"):
+                stmt = code if code.endswith(";") else f"{code};"
+                current_body.append(stmt)
+                current_has_code = True
+                _flush_current()
+                continue
+
+            current_body.append(raw)
+            if code:
+                current_has_code = True
+
+        _flush_current()
+        return case_groups, default_body
+
     def _extract_else_inline(self, header: str) -> str:
         """Return inline body (if any) following an else token."""
 
@@ -1741,6 +1863,8 @@ class ASLInterpreter(GObject.Object):
         k = 0
         while k < len(lines):
             s = lines[k].strip()
+            if "++" in s:
+                print("incrementing")
             if not s:
                 k += 1
                 continue
@@ -1793,6 +1917,59 @@ class ASLInterpreter(GObject.Object):
                 if broke_loop:
                     continue
                 continue
+            if s.startswith("switch"):
+                header, header_end = self._collect_iflike_header(lines, k, "switch")
+                switch_expr, inline_suffix = self._split_switch_expr(header)
+                if switch_expr is None:
+                    k = header_end
+                    continue
+
+                inline_suffix = inline_suffix.strip()
+                block_start = header_end
+                if "{" in inline_suffix:
+                    block_start = max(k, header_end - 1)
+                k_body_end, body_lines = self._consume_block_from_list(
+                    lines, block_start
+                )
+                if not body_lines:
+                    k = k_body_end
+                    continue
+
+                case_groups, default_body = self._parse_switch_cases(body_lines)
+                selector = self._eval_value(switch_expr, local_store)
+                matched = False
+                result = None
+
+                for labels, body in case_groups:
+                    for label_expr in labels:
+                        label_val = self._eval_value(label_expr, local_store)
+                        if label_val is None:
+                            try:
+                                label_val = ast.literal_eval(label_expr)
+                            except Exception:
+                                label_val = label_expr
+                        if selector == label_val:
+                            matched = True
+                            result = self._exec_lines(body, local_store)
+                            if result is self._FLOW_CONTINUE:
+                                return result
+                            if result is self._FLOW_BREAK:
+                                result = None
+                            break
+                    if matched:
+                        break
+
+                if not matched and default_body is not None:
+                    result = self._exec_lines(default_body, local_store)
+                    if result is self._FLOW_CONTINUE:
+                        return result
+                    if result is self._FLOW_BREAK:
+                        result = None
+
+                k = k_body_end
+                if getattr(self, "_action_return_set", False):
+                    return
+                continue
             if s.startswith("if"):
                 header, header_end = self._collect_iflike_header(lines, k, "if")
                 cond_loc, inline_suffix = self._split_if_condition(header)
@@ -1810,12 +1987,17 @@ class ASLInterpreter(GObject.Object):
                     )
                 # Collect zero or more else-if branches and optional final else
                 j2 = k_then_end
-                while j2 < len(lines) and lines[j2].strip() == "":
+                while j2 < len(lines) and self._line_is_trivia(lines[j2]):
                     j2 += 1
                 elif_branches: list[tuple[str, list[str]]] = []
                 else_lines_loc: list[str] | None = None
-                while j2 < len(lines) and lines[j2].strip().startswith("else"):
+                while j2 < len(lines):
+                    if self._line_is_trivia(lines[j2]):
+                        j2 += 1
+                        continue
                     token2 = lines[j2].strip()
+                    if not token2.startswith("else"):
+                        break
                     if token2.startswith("else if"):
                         header2, header2_end = self._collect_iflike_header(
                             lines, j2, "else if"
@@ -1843,7 +2025,7 @@ class ASLInterpreter(GObject.Object):
                                 lines, j2
                             )
                         break
-                    while j2 < len(lines) and lines[j2].strip() == "":
+                    while j2 < len(lines) and self._line_is_trivia(lines[j2]):
                         j2 += 1
 
                 # Decide branch across then/elif*/else
@@ -1860,6 +2042,8 @@ class ASLInterpreter(GObject.Object):
                     if not matched and else_lines_loc is not None:
                         chosen = else_lines_loc
 
+                if "tempVar" in ",".join(chosen) and s != "if(current.chapter > 0)":
+                    print("found tempVar")
                 result = self._exec_lines(chosen, local_store)
                 if result is self._FLOW_CONTINUE or result is self._FLOW_BREAK:
                     return result
@@ -1913,12 +2097,17 @@ class ASLInterpreter(GObject.Object):
             then_end, then_lines = self._read_block_or_single(body_idx)
         # Collect zero or more else-if branches and optional final else
         j = then_end
-        while j < n and self.asl_script[j].strip() == "":
+        while j < n and self._line_is_trivia(self.asl_script[j]):
             j += 1
         elif_branches: list[tuple[str, list[str]]] = []
         else_lines: list[str] | None = None
-        while j < n and self.asl_script[j].strip().startswith("else"):
+        while j < n:
+            if self._line_is_trivia(self.asl_script[j]):
+                j += 1
+                continue
             token = self.asl_script[j].strip()
+            if not token.startswith("else"):
+                break
             if token.startswith("else if"):
                 header2, header2_end = self._collect_iflike_header(
                     self.asl_script, j, "else if"
@@ -1944,7 +2133,7 @@ class ASLInterpreter(GObject.Object):
                 else:
                     j, else_lines = self._read_block_or_single(j)
                 break
-            while j < n and self.asl_script[j].strip() == "":
+            while j < n and self._line_is_trivia(self.asl_script[j]):
                 j += 1
 
         # Decide which branch to execute
@@ -2027,6 +2216,86 @@ class ASLInterpreter(GObject.Object):
                 a = "" if addend is None else str(addend)
                 return b + a
 
+        def _apply_increment(target: str, amount: int = 1):
+            if not target:
+                return None
+            if target.startswith("vars."):
+                target_expr = target.replace("vars.", "", 1)
+                if target_expr.endswith("]"):
+                    base, index = self._split_indexer(target_expr, local_store)
+                    if base and index is not None:
+                        container = self.vars.get(base)
+                        if container is None:
+                            container = [] if isinstance(index, int) else {}
+                            self.vars[base] = container
+                        current_val = self._get_index_value(container, index)
+                        self._assign_index(
+                            container,
+                            index,
+                            _combine_augmented(current_val, amount),
+                        )
+                        return None
+                key = target_expr
+                current_val = self.vars.get(key)
+                self.vars[key] = _combine_augmented(current_val, amount)
+                return None
+
+            if target.startswith("current."):
+                target_expr = target.replace("current.", "", 1)
+                if target_expr.endswith("]"):
+                    base, index = self._split_indexer(target_expr, local_store)
+                    if base and index is not None:
+                        container = self.current.get(base)
+                        if container is None:
+                            container = [] if isinstance(index, int) else {}
+                            self.current[base] = container
+                        current_val = self._get_index_value(container, index)
+                        self._assign_index(
+                            container,
+                            index,
+                            _combine_augmented(current_val, amount),
+                        )
+                        return None
+                key = target_expr
+                current_val = self.current.get(key)
+                self.current[key] = _combine_augmented(current_val, amount)
+                return None
+
+            if target.startswith("timer."):
+                attr = target.split(".", 1)[1]
+                current_val = getattr(self.timer, attr, None)
+                try:
+                    setattr(
+                        self.timer,
+                        attr,
+                        _combine_augmented(current_val, amount),
+                    )
+                except Exception:
+                    pass
+                return None
+
+            if local_store is not None:
+                if target.endswith("]"):
+                    base, index = self._split_indexer(target, local_store)
+                    if base and index is not None:
+                        container = local_store.get(base)
+                        if container is None:
+                            container = [] if isinstance(index, int) else {}
+                            local_store[base] = container
+                        current_val = self._get_index_value(container, index)
+                        self._assign_index(
+                            container,
+                            index,
+                            _combine_augmented(current_val, amount),
+                        )
+                        return local_store
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", target):
+                    current_val = local_store.get(target)
+                    local_store[target] = _combine_augmented(current_val, amount)
+                    return local_store
+
+            return None
+
         # Local var declarations
         if s.startswith("var ") and "=" in s and s.endswith(";"):
             name = s.split("=", 1)[0].strip().split(" ", 1)[1].strip()
@@ -2041,6 +2310,15 @@ class ASLInterpreter(GObject.Object):
         # Assignments to vars.* or current.* or timer.*
         if s.endswith(";"):
             stmt = s.rstrip().rstrip(";")
+            if "++" in stmt and "=" not in stmt:
+                m_prefix = re.match(r"^\+\+\s*(.+)$", stmt)
+                if m_prefix:
+                    target = m_prefix.group(1).strip()
+                    return _apply_increment(target)
+                m_postfix = re.match(r"^(.+?)\s*\+\+$", stmt)
+                if m_postfix:
+                    target = m_postfix.group(1).strip()
+                    return _apply_increment(target)
             if "+=" in stmt:
                 lhs, rhs = stmt.split("+=", 1)
                 lhs = lhs.strip()
@@ -2168,7 +2446,23 @@ class ASLInterpreter(GObject.Object):
                     pass
                 return None
 
-            elif lhs.split(" ", 1)[0] in type_map.keys():
+            if local_store is not None:
+                if lhs.endswith("]"):
+                    base, index = self._split_indexer(lhs, local_store)
+                    if base and index is not None:
+                        container = local_store.get(base)
+                        if container is None:
+                            container = [] if isinstance(index, int) else {}
+                            local_store[base] = container
+                        val = self._evaluate_rhs(rhs, local_store, statement_index)
+                        self._assign_index(container, index, val)
+                        return local_store
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", lhs):
+                    val = self._evaluate_rhs(rhs, local_store, statement_index)
+                    local_store[lhs] = val
+                    return local_store
+
+            if lhs.split(" ", 1)[0] in type_map.keys():
                 var_type, var_name = lhs.split(" ", 1)
                 val = self._evaluate_rhs(rhs, local_store, statement_index)
                 local_store[var_name] = val

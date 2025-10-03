@@ -117,17 +117,17 @@ class LSSObject(GObject.Object):
                     real_time = self.convert_time_string(
                         attempt.find("RealTime").text
                         if attempt.find("RealTime") is not None
-                        else ""
+                        else "00:00:00"
                     )
                     game_time = self.convert_time_string(
                         attempt.find("GameTime").text
                         if attempt.find("GameTime") is not None
-                        else ""
+                        else "00:00:00"
                     )
                     pause_time = self.convert_time_string(
                         attempt.find("PauseTime").text
                         if attempt.find("PauseTime") is not None
-                        else ""
+                        else "00:00:00"
                     )
                     self.attempt_history.append(
                         LSSBaseTime(
@@ -160,7 +160,9 @@ class LSSObject(GObject.Object):
             return
         self.if_autosplitter = True
         if self._autosplitter_element is None:
-            self._autosplitter_element = ET.SubElement(self._root, "AutoSplitterSettings")
+            self._autosplitter_element = ET.SubElement(
+                self._root, "AutoSplitterSettings"
+            )
         if self._custom_settings_element is None:
             self._custom_settings_element = ET.SubElement(
                 self._autosplitter_element, "CustomSettings"
@@ -198,16 +200,28 @@ class LSSObject(GObject.Object):
             best_segment_time = LSSBaseTime(
                 self.convert_time_string(
                     segment.find("BestSegmentTime").find("RealTime").text
+                    if segment.find("BestSegmentTime").find("RealTime") is not None
+                    else "00:00:00"
                 ),
                 self.convert_time_string(
                     segment.find("BestSegmentTime").find("GameTime").text
+                    if segment.find("BestSegmentTime").find("GameTime") is not None
+                    else "00:00:00"
                 ),
             )
             segment_history = []
             for split_time in segment.find("SplitTimes"):
                 split_name = split_time.attrib.get("name", "")
-                real_time = self.convert_time_string(split_time.find("RealTime").text)
-                game_time = self.convert_time_string(split_time.find("GameTime").text)
+                real_time = (
+                    self.convert_time_string(split_time.find("RealTime").text)
+                    if split_time.find("RealTime") is not None
+                    else 0
+                )
+                game_time = (
+                    self.convert_time_string(split_time.find("GameTime").text)
+                    if split_time.find("GameTime") is not None
+                    else 0
+                )
                 split_times.append(LSSBaseTime(real_time, game_time, name=split_name))
             for split_time in segment.find("SegmentHistory"):
                 real_time = self.convert_time_string(split_time.find("RealTime").text)

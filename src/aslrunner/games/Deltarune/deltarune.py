@@ -4,6 +4,7 @@ import os
 import re
 import struct
 import hashlib
+import time
 from typing import Optional
 from pathlib import Path
 
@@ -60,6 +61,13 @@ class DeltarunePlugin:
         self._ptrs: dict[str, Optional[int]] = {"array": None, "roomid": None}
         # Signature metadata prepared from ASL init: name -> { 'x64': {off, sig}, 'x86': {off, sig} }
         self._asl_sigs: Optional[dict] = None
+        # Throttle expensive process/module discovery work
+        self._last_pid_refresh: float = 0.0
+        self._pid_rescan_interval: float = 0.5
+        self._last_module_refresh: float = 0.0
+        self._module_rescan_interval: float = 0.5
+        self._cached_modules: Optional[list[dict]] = None
+        self._cached_modules_ts: float = 0.0
 
     # -------- lifecycle --------
     def setup(self):
@@ -72,29 +80,103 @@ class DeltarunePlugin:
             pass
 
     def _refresh_pid(self):
-        procs = find_wine_process(self.process_name)
-        if procs:
-            self.pid = procs[0]["pid"]
-            self.ptr64 = is_64_bit(self.pid)
-            # Cache the main module base for fallback addressing (e.g., DELTARUNE.exe)
-            try:
-                mods = list(self._iter_main_module() or [])
-                if mods:
-                    self._main_module_base = mods[0][0]
-            except Exception:
-                self._main_module_base = None
-        else:
+        now = time.monotonic()
+
+        # Fast-path: keep existing pid if process still alive
+        if self.pid and os.path.exists(f"/proc/{self.pid}"):
+            return
+
+        if self.pid:
+            # Process vanished; clear cached pointers so a new instance can be scanned
+            self._reset_process_state()
             self.pid = None
 
-    # -------- low-level helpers --------
-    def _iter_main_module(self):
+        if now - self._last_pid_refresh < self._pid_rescan_interval:
+            return
+        self._last_pid_refresh = now
+
+        procs = find_wine_process(self.process_name)
+        if not procs:
+            return
+
+        new_pid = procs[0]["pid"]
+        if new_pid != self.pid:
+            self.pid = new_pid
+            self.ptr64 = is_64_bit(self.pid)
+            self._reset_process_state()
+            self._ensure_main_module_cached(force=True)
+        elif self._main_module_base is None:
+            self._ensure_main_module_cached()
+
+    def _reset_process_state(self):
+        self._scanned = False
+        self._module_start = None
+        self._module_end = None
+        self._main_module_base = None
+        self._ptrs = {"array": None, "roomid": None}
+        self._last_module_refresh = 0.0
+        self._invalidate_module_cache()
+
+    def _invalidate_module_cache(self):
+        self._cached_modules = None
+        self._cached_modules_ts = 0.0
+
+    def _get_cached_modules(self, force: bool = False) -> list[dict]:
         if not self.pid:
-            return None
+            return []
+        now = time.monotonic()
+        if (
+            not force
+            and self._cached_modules is not None
+            and now - self._cached_modules_ts < self._module_rescan_interval
+        ):
+            return self._cached_modules
+        try:
+            mods = get_all_modules(self.pid)
+        except Exception:
+            mods = []
+        self._cached_modules = mods
+        self._cached_modules_ts = now
+        return mods
+
+    def _ensure_main_module_cached(self, force: bool = False):
+        if not self.pid:
+            return
+        now = time.monotonic()
+        if (
+            self._main_module_base is not None
+            and not force
+        ):
+            return
+        if not force and now - self._last_module_refresh < self._module_rescan_interval:
+            return
+        self._last_module_refresh = now
+        try:
+            mods = self._iter_main_module(force=force)
+            if mods:
+                self._main_module_base = mods[0][0]
+        except Exception:
+            self._main_module_base = None
+
+    # -------- low-level helpers --------
+    def _iter_main_module(self, force: bool = False):
+        if not self.pid:
+            return []
         # Prefer mapping that matches the process name (e.g., DELTARUNE.exe)
         preferred = f"{self.process_name.lower()}.exe"
         fallback = None
         pls_help = []
-        for start, end, perms, path in _iter_maps(self.pid):
+        modules = self._get_cached_modules(force=force)
+        # If cache miss returned empty, try one forced refresh before bailing
+        if not modules and not force:
+            modules = self._get_cached_modules(force=True)
+        for mod in modules:
+            start = mod.get("start")
+            end = mod.get("end")
+            perms = mod.get("perms", "")
+            path = mod.get("path", "")
+            if start is None or end is None:
+                continue
             base = os.path.basename(path).lower()
             if base == preferred and ("r" in perms):
                 pls_help.append((start, end, perms, path))
@@ -137,12 +219,7 @@ class DeltarunePlugin:
             return None
         # Ensure we have at least one candidate base
         if self._main_module_base is None and self._module_start is None:
-            try:
-                mods = list(self._iter_main_module() or [])
-                if mods:
-                    self._main_module_base = mods[0][0]
-            except Exception:
-                self._main_module_base = None
+            self._ensure_main_module_cached()
 
         candidates = []
         if self._module_start is not None:
@@ -370,7 +447,7 @@ class DeltarunePlugin:
 
         # 2) Fallback: scan all .exe/.dll modules until found
         try:
-            for m in get_all_modules(self.pid):
+            for m in self._get_cached_modules():
                 base = os.path.basename(m["path"]).lower()
                 if not (base.endswith(".exe") or base.endswith(".dll")):
                     continue
@@ -392,6 +469,39 @@ class DeltarunePlugin:
                     return
         except Exception:
             pass
+
+    def _convert_to_plaintext(self, text: str) -> str:
+        """Convert Deltarune text with inline formatting codes to plain text.
+
+        Example: "Hello {w}world{/w}!" -> "Hello world!"
+        """
+        # 1. Pause markers: ^<number>
+        s = re.sub(r"\^\d+", "", s)
+
+        # 2. Flow control
+        s = re.sub(r"&", "", s)
+        s = re.sub(r"/\%\%", "", s)
+        s = re.sub(r"/\%", "", s)
+        s = re.sub(r"/%", "", s)
+        s = re.sub(r"%", "", s)
+        s = re.sub(r"/\*", "", s)
+        s = re.sub(r"\\C", "", s)
+
+        # 3. Colors (\W, \X, \p, etc.)
+        s = re.sub(r"\\[WXRROYGLBP]", "", s)  # single-letter codes
+        s = re.sub(r"\\p", "", s)  # lowercase p
+
+        # 4. Text modes (\T…)
+        s = re.sub(r"\\T[a-zA-Z0-9]", "", s)
+
+        # 5. Special sequences
+        s = re.sub(r"#", "", s)  # octothorpe = newline marker in "free text"
+        s = re.sub(r"\\z\d+", "", s)  # e.g. \z4
+
+        # 6. Collapse extra spaces
+        s = re.sub(r"\s+", " ", s).strip()
+
+        return s
 
     def initialize(self, interpreter):
         # Parse ASL init block for signature patterns and offsets
@@ -447,7 +557,8 @@ class DeltarunePlugin:
 
         game_hash = ""
         try:
-            exe_path = get_all_modules(self.pid)[0]["path"]
+            modules = self._get_cached_modules(force=True)
+            exe_path = modules[0]["path"]
             data_win = Path(exe_path).parent / "data.win"
             with open(data_win, "rb") as f:
                 data = f.read()

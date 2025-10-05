@@ -42,6 +42,8 @@ class Timer(GObject.Object):
         self.asl_object = None
         self.lss = None
         self.lss_path: str | None = None
+        self._completion_idle_id: int | None = None
+        self._pending_completion_splits: list[float] | None = None
         GLib.timeout_add(25, self.on_interval, GLib.PRIORITY_HIGH)
 
     def on_interval(self, *_args):
@@ -76,6 +78,15 @@ class Timer(GObject.Object):
             t = self.current_elapsed()
             self.cur_splits.append(t)
             self.emit("split_signal")
+            if (
+                self.segments.get_n_items() > 0
+                and len(self.cur_splits) >= self.segments.get_n_items()
+                and self._completion_idle_id is None
+            ):
+                self._pending_completion_splits = list(self.cur_splits)
+                self._completion_idle_id = GLib.idle_add(
+                    self._finalize_run_completion
+                )
 
     def on_reset(self):
         self.running = False
@@ -83,6 +94,9 @@ class Timer(GObject.Object):
         self.accum = 0.0
         self.time_string = "00:00.00"
         self.splits.clear()
+        self.cur_splits.clear()
+        self._pending_completion_splits = None
+        self._completion_idle_id = None
         self.emit("reset_signal")
 
     def load_splits(self, lss_path: str):
@@ -118,12 +132,28 @@ class Timer(GObject.Object):
             self.asl_object = None
 
         for segment in lss.segments:
+            pb_split = None
+            for split in segment.splits:
+                if split.name == "Personal Best":
+                    pb_split = split
+                    break
+            if pb_split is None and segment.splits:
+                pb_split = segment.splits[0]
+            best_real = (
+                pb_split.real_time
+                if pb_split and pb_split.real_time < float(1e308)
+                else segment.best_segment_time.real_time
+            )
+            if best_real >= float(1e308):
+                best_display = "00:00.00"
+            else:
+                best_display = self.format_time(best_real)
             split_item = SplitItem(
                 segment.name,
                 "00:00.00",
-                self.format_time(segment.best_segment_time.game_time),
+                best_display,
                 float(1e308),
-                segment.best_segment_time.game_time,
+                best_real,
             )
             tmp_segments.append(split_item)
         self.segments.update_rows(tmp_segments)
@@ -187,3 +217,22 @@ class Timer(GObject.Object):
             self.lss.save(self.lss_path)
         except Exception as exc:
             print(f"Failed to save LSS autosplitter settings: {exc}")
+
+    def _finalize_run_completion(self):
+        splits = self._pending_completion_splits or []
+        self._pending_completion_splits = None
+        self._completion_idle_id = None
+        if splits:
+            self.complete_run(splits)
+        return GLib.SOURCE_REMOVE
+
+    def complete_run(self, splits: list[float]):
+        if not splits:
+            return
+        if self.lss and self.lss_path:
+            try:
+                if self.lss.add_completed_run(splits):
+                    self.lss.save(self.lss_path)
+            except Exception as exc:
+                print(f"Failed to save completed run: {exc}")
+        self.on_reset()

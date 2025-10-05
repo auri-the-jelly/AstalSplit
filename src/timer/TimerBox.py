@@ -17,7 +17,6 @@ class TimerBox(Gtk.Box):
         self.timer = Timer
         self.splits_box = SplitsBox(self.timer.segments)
         self.time_label = Gtk.Label(label=Timer.time_string)
-        self.splits_box.connect("end_signal", lambda *_: self.timer.on_reset())
         self.timer.connect("split_signal", self.on_split)
         self.timer.bind_property("time_string", self.time_label, "label", SYNC)
         self.append(self.time_label)

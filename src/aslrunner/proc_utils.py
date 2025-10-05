@@ -1,5 +1,32 @@
 #!/usr/bin/env python3
-import os, re, sys, time, struct, ctypes, ctypes.util, errno
+import os, re, time, struct, ctypes, ctypes.util, errno
+from dataclasses import dataclass
+
+
+
+@dataclass(frozen=True)
+class _MapEntry:
+    start: int
+    end: int
+    perms: str
+    path: str
+    base: str
+
+
+@dataclass
+class _MapsCacheEntry:
+    timestamp: float
+    start_time: float
+    maps: list
+
+
+_PID_CACHE: dict[str, tuple[int, float]] = {}
+_PID_START_TIMES: dict[int, float] = {}
+_MAPS_CACHE: dict[int, _MapsCacheEntry] = {}
+_MODULE_BASE_CACHE: dict[tuple[int, str], tuple[float, int]] = {}
+_PTR_SIZE_CACHE: dict[int, tuple[float, bool]] = {}
+
+_MAPS_CACHE_TTL = 0.5  # seconds between /proc/<pid>/maps refreshes
 
 
 def find_wine_process(name: str):
@@ -31,6 +58,110 @@ def find_wine_process(name: str):
             exe_arg = next(arg for arg in argv if exe_pat.search(arg))
             matches.append({"pid": pid, "exe_arg": exe_arg, "argv": argv})
     return matches
+
+
+# -------- caching helpers --------
+def _get_proc_start_time(pid: int):
+    try:
+        return os.stat(f"/proc/{pid}").st_ctime
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        return None
+
+
+def _purge_module_cache_for_pid(pid: int):
+    for key in [key for key in _MODULE_BASE_CACHE if key[0] == pid]:
+        _MODULE_BASE_CACHE.pop(key, None)
+
+
+def _invalidate_pid(pid: int):
+    _MAPS_CACHE.pop(pid, None)
+    _PTR_SIZE_CACHE.pop(pid, None)
+    _PID_START_TIMES.pop(pid, None)
+    _purge_module_cache_for_pid(pid)
+    for name, (cached_pid, _) in list(_PID_CACHE.items()):
+        if cached_pid == pid:
+            _PID_CACHE.pop(name, None)
+
+
+def _register_pid(process_name: str, pid: int):
+    start_time = _get_proc_start_time(pid)
+    if start_time is None:
+        return None
+    _PID_CACHE[process_name] = (pid, start_time)
+    _PID_START_TIMES[pid] = start_time
+    return pid
+
+
+def _ensure_pid_registered(pid: int):
+    if pid is None:
+        return False
+    if pid in _PID_START_TIMES:
+        current = _get_proc_start_time(pid)
+        if current is None:
+            _invalidate_pid(pid)
+            return False
+        if current != _PID_START_TIMES[pid]:
+            _invalidate_pid(pid)
+            return False
+        return True
+    start_time = _get_proc_start_time(pid)
+    if start_time is None:
+        return False
+    _PID_START_TIMES[pid] = start_time
+    return True
+
+
+def _get_cached_pid(process_name: str):
+    cached = _PID_CACHE.get(process_name)
+    if cached:
+        pid, start_time = cached
+        current = _get_proc_start_time(pid)
+        if current is not None and current == start_time:
+            _PID_START_TIMES[pid] = start_time
+            return pid
+        _invalidate_pid(pid)
+    matches = find_wine_process(process_name)
+    if not matches:
+        return None
+    pid = matches[0]["pid"]
+    return _register_pid(process_name, pid)
+
+
+def _read_maps(pid: int):
+    entries = []
+    path = f"/proc/{pid}/maps"
+    with open(path, "r") as f:
+        for line in f:
+            rng, perms, offset, dev, inode, *raw_path = line.strip().split()
+            start_s, end_s = rng.split("-")
+            start = int(start_s, 16)
+            end = int(end_s, 16)
+            mapped_path = raw_path[0] if raw_path else ""
+            base = os.path.basename(mapped_path).lower() if mapped_path else ""
+            entries.append(_MapEntry(start, end, perms, mapped_path, base))
+    return entries
+
+
+def _get_maps(pid: int, use_cache: bool = True):
+    if not _ensure_pid_registered(pid):
+        raise FileNotFoundError
+    start_time = _PID_START_TIMES.get(pid)
+    if use_cache:
+        cache = _MAPS_CACHE.get(pid)
+        now = time.monotonic()
+        if cache and cache.start_time == start_time and (now - cache.timestamp) <= _MAPS_CACHE_TTL:
+            return cache.maps
+    try:
+        maps = _read_maps(pid)
+    except FileNotFoundError:
+        _invalidate_pid(pid)
+        raise
+    now = time.monotonic()
+    _purge_module_cache_for_pid(pid)
+    _MAPS_CACHE[pid] = _MapsCacheEntry(timestamp=now, start_time=start_time or 0.0, maps=maps)
+    return maps
 
 
 # -------- libc + process_vm_readv --------
@@ -74,15 +205,9 @@ def _process_vm_read(pid: int, addr: int, size: int) -> bytes:
 
 
 # -------- maps parsing --------
-def iter_maps(pid):
-    with open(f"/proc/{pid}/maps", "r") as f:
-        for line in f:
-            rng, perms, offset, dev, inode, *path = line.strip().split()
-            start_s, end_s = rng.split("-")
-            start = int(start_s, 16)
-            end = int(end_s, 16)
-            path = path[0] if path else ""
-            yield (start, end, perms, path)
+def iter_maps(pid, use_cache: bool = True):
+    for entry in _get_maps(pid, use_cache=use_cache):
+        yield (entry.start, entry.end, entry.perms, entry.path)
 
 
 def find_region(pid, addr, size=1):
@@ -96,23 +221,37 @@ def get_module_base(pid, needle):
     if os.path.exists(needle):
         needle = os.path.basename(needle)
     needle = (needle or "").lower()
-    for start, end, perms, path in iter_maps(pid):
-        base = os.path.basename(path).lower()
+    if not needle:
+        return None
+    start_time = _PID_START_TIMES.get(pid)
+    cache_key = (pid, needle)
+    if start_time is not None:
+        cached = _MODULE_BASE_CACHE.get(cache_key)
+        if cached and cached[0] == start_time:
+            return cached[1]
+    for entry in _get_maps(pid):
         if (
-            needle
-            and needle in base
-            and ("r--p" in perms or "r-xp" in perms or "rw-p" in perms)
+            needle in entry.base
+            and ("r--p" in entry.perms or "r-xp" in entry.perms or "rw-p" in entry.perms)
         ):
-            return start
+            if start_time is not None:
+                _MODULE_BASE_CACHE[cache_key] = (start_time, entry.start)
+            return entry.start
     return None
 
 
 def get_all_modules(pid):
     modules = []
-    for start, end, perms, path in iter_maps(pid):
-        base = os.path.basename(path).lower()
-        if ".exe" in base:
-            modules.append({"start": start, "end": end, "perms": perms, "path": path})
+    for entry in _get_maps(pid):
+        if ".exe" in entry.base:
+            modules.append(
+                {
+                    "start": entry.start,
+                    "end": entry.end,
+                    "perms": entry.perms,
+                    "path": entry.path,
+                }
+            )
     return modules
 
 
@@ -120,12 +259,11 @@ def get_module_memory(pid, needle):
     if os.path.exists(needle):
         needle = os.path.basename(needle)
     needle = needle.lower()
-    for start, end, perms, path in iter_maps(pid):
-        base = os.path.basename(path).lower()
-        if needle == base and ("r--p" in perms or "r-xp" in perms):
-            size = end - start
+    for entry in _get_maps(pid):
+        if needle == entry.base and ("r--p" in entry.perms or "r-xp" in entry.perms):
+            size = entry.end - entry.start
             try:
-                return _process_vm_read(pid, start, size)
+                return _process_vm_read(pid, entry.start, size)
             except OSError:
                 # Fall back to empty on failure; callers handle None/empty
                 return None
@@ -139,13 +277,23 @@ def pread_mem(pid: int, addr: int, size: int) -> bytes:
 
 # -------- pointer chain --------
 def is_64_bit(pid):
+    if not _ensure_pid_registered(pid):
+        return struct.calcsize("P") == 8
+    start_time = _PID_START_TIMES.get(pid)
+    cached = _PTR_SIZE_CACHE.get(pid)
+    if cached and start_time is not None and cached[0] == start_time:
+        return cached[1]
+
     # Prefer the executable symlink for architecture detection
     try:
         exe = os.readlink(f"/proc/{pid}/exe")
         with open(exe, "rb") as f:
             hdr = f.read(5)
             if hdr[:4] == b"\x7fELF":
-                return hdr[4] == 2  # 2=ELFCLASS64, 1=ELFCLASS32
+                result = hdr[4] == 2  # 2=ELFCLASS64, 1=ELFCLASS32
+                if start_time is not None:
+                    _PTR_SIZE_CACHE[pid] = (start_time, result)
+                return result
     except Exception:
         pass
 
@@ -156,12 +304,18 @@ def is_64_bit(pid):
                 with open(path, "rb") as f:
                     hdr = f.read(5)
                     if hdr[:4] == b"\x7fELF":
-                        return hdr[4] == 2
+                        result = hdr[4] == 2
+                        if start_time is not None:
+                            _PTR_SIZE_CACHE[pid] = (start_time, result)
+                        return result
             except Exception:
                 continue
 
     # Last resort: assume current Python's pointer size
-    return struct.calcsize("P") == 8
+    result = struct.calcsize("P") == 8
+    if start_time is not None:
+        _PTR_SIZE_CACHE[pid] = (start_time, result)
+    return result
 
 
 def read_ptr(pid, addr, ptr64=True):
@@ -230,16 +384,17 @@ def find_variable_value(
     var_type: str = "string256",
     pid: int = None,
 ):
-    if not pid:
-        pid = (
-            find_wine_process(process_name)[0]["pid"]
-            if find_wine_process(process_name)
-            else None
-        )
-    if not pid:
+    if pid is None:
+        pid = _get_cached_pid(process_name)
+    else:
+        if not _ensure_pid_registered(pid):
+            pid = _get_cached_pid(process_name)
+    if pid is None:
         return None
 
     try:
+        if not _ensure_pid_registered(pid):
+            return None
 
         # 2) Resolve base address
         # Default to main module '<process_name>.exe' if not provided

@@ -119,25 +119,40 @@ class _Stopwatch:
 class ASLModule(GObject.Object):
     __gtype__name__ = "ASLModule"
 
-    def __init__(self, process_name: str = None):
+    def __init__(self, process_name: str = None, *, matches: list[dict] | None = None):
         super().__init__()
-        if process_name and find_wine_process(process_name):
-            self.process = find_wine_process(process_name)[0]
+        if process_name and matches is None:
+            # Fallback to direct lookup when no cached matches supplied
+            try:
+                matches = find_wine_process(process_name)
+            except Exception:
+                matches = []
+
+        self.process = None
+        self.modules = []
+        self.game = None
+        self.BaseAddress = None
+        self.ModuleMemorySize = None
+        self.FileName = None
+
+        if matches:
+            self.process = matches[0]
             self.modules = get_all_modules(self.process["pid"]) if self.process else []
             if self.modules:
-                self.game = self.First()
-                self.BaseAddress = get_module_base(
-                    self.process["pid"], self.First()["path"]
-                )
-                self.ModuleMemorySize = get_module_memory(
-                    self.process["pid"], self.First()["path"]
-                )
-                self.FileName = Path(self.First()["path"]).parent
+                first = self.modules[0]
+                if first:
+                    self.game = first
+                    self.BaseAddress = get_module_base(
+                        self.process["pid"], first["path"]
+                    )
+                    self.ModuleMemorySize = get_module_memory(
+                        self.process["pid"], first["path"]
+                    )
+                    self.FileName = Path(first["path"]).parent
+                else:
+                    self.process = None
             else:
                 self.process = None
-
-        else:
-            self.process = None
 
     def First(self):
         try:
@@ -313,6 +328,9 @@ class ASLInterpreter(GObject.Object):
         # Expose a dummy timer for ASL access
         self.timer = DummyTimer()
         self._has_started = False
+        # Cached process lookups to avoid repeated /proc scans every tick
+        self._process_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._process_cache_ttl = 0.5
         # endregion
         # region Initialization
         self.modules = ASLModule()
@@ -336,7 +354,7 @@ class ASLInterpreter(GObject.Object):
                 if key in self.settings.settings:
                     self.settings.settings[key]["value"] = val
 
-        self._tick_interval = 1.0 / 60.0
+        self._tick_interval = 1.0 / 40.0
         self._worker_stop = threading.Event()
         self._worker_thread = None
 
@@ -359,6 +377,25 @@ class ASLInterpreter(GObject.Object):
             remaining = tick - elapsed
             if remaining > 0:
                 self._worker_stop.wait(remaining)
+
+    def _find_processes(
+        self, process_name: str, *, force_refresh: bool = False
+    ) -> list[dict]:
+        if not process_name:
+            return []
+        now = time.monotonic()
+        if not force_refresh:
+            cached = self._process_cache.get(process_name)
+            if cached:
+                ts, matches = cached
+                if now - ts <= self._process_cache_ttl:
+                    return matches
+        try:
+            matches = find_wine_process(process_name)
+        except Exception:
+            matches = []
+        self._process_cache[process_name] = (now, matches)
+        return matches
 
     def start_runtime(self):
         if self._worker_thread and self._worker_thread.is_alive():
@@ -522,10 +559,7 @@ class ASLInterpreter(GObject.Object):
     def state_update(self):
         for state in self.states:
             # Refresh module handle if current PID is invalid or replaced
-            try:
-                found = find_wine_process(state.process_name)
-            except Exception:
-                found = []
+            found = self._find_processes(state.process_name)
 
             if self.modules and getattr(self.modules, "process", None):
                 cur_pid = (
@@ -537,8 +571,9 @@ class ASLInterpreter(GObject.Object):
                 )
                 # If pid not alive or not among matching processes, try to switch
                 if not cur_alive or not same_in_found:
+                    found = self._find_processes(state.process_name, force_refresh=True)
                     if found:
-                        self.modules = ASLModule(state.process_name)
+                        self.modules = ASLModule(state.process_name, matches=found)
                         self.initialized = False
                     else:
                         # No matching process currently; clear modules
@@ -547,12 +582,15 @@ class ASLInterpreter(GObject.Object):
             else:
                 # No modules yet; attach if a matching process exists
                 if found:
-                    self.modules = ASLModule(state.process_name)
+                    self.modules = ASLModule(state.process_name, matches=found)
                     self.initialized = False
             if self.version == "Unknown":
                 self.initialized = False
                 break
             if state.version == self.version:
+                state_pid = None
+                if self.modules and getattr(self.modules, "process", None):
+                    state_pid = self.modules.process.get("pid")
                 for var_name, meta in state.variables.items():
                     try:
                         val = find_variable_value(
@@ -561,13 +599,13 @@ class ASLInterpreter(GObject.Object):
                             meta.get("offsets", []),
                             meta.get("base_module", "") or "",
                             meta.get("type", "string256"),
+                            pid=state_pid,
                         )
                         if var_name in self.current and self.current[var_name]:
                             self.old[var_name] = self.current[var_name]
                         self.current[var_name] = val
                     except Exception as e:
                         self.current[var_name] = None
-
         if self.initialized:
             self.emit("initialized")
             # Run update and honor an explicit 'return false;' in the bloc
